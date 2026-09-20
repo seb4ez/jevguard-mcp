@@ -651,8 +651,10 @@ class QuestionOptimizer:
             }
 
         elif q_type == "choice":
-            raw_crit = q.get("criteria") if isinstance(q.get("criteria"), dict) else q.get("options", {})
-            if not isinstance(raw_crit, dict):
+            raw_crit = q.get("criteria") if q.get("criteria") is not None else q.get("options", {})
+            if isinstance(raw_crit, list):
+                raw_crit = {str(item): str(item) for item in raw_crit}
+            elif not isinstance(raw_crit, dict):
                 raw_crit = {}
             criteria = {str(k): str(v) for k, v in raw_crit.items()}
             closed = bool(q.get("closed_world", False))
