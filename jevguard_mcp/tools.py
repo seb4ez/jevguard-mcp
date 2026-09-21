@@ -949,11 +949,12 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "state": {
-                            "description": "Input state payload to evaluate against criteria."
+                            "type": "object",
+                            "description": "Input state payload dictionary or structure to evaluate against criteria.",
                         },
                         "questions": {
-                            "description": "Dictionary or list of question definitions (noul, score, choice).",
-                            "oneOf": [{"type": "object"}, {"type": "array"}],
+                            "type": "object",
+                            "description": "Dictionary of question definitions mapping question keys to criteria (noul, score, choice).",
                         },
                         "model": {
                             "type": "string",
@@ -1034,7 +1035,8 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "state": {
-                            "description": "The state payload (dict, list, or primitive) to sanitize and prune."
+                            "type": "object",
+                            "description": "The state payload dictionary or structure to sanitize and prune.",
                         },
                         "prune_lists": {
                             "type": "boolean",
@@ -1055,11 +1057,12 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "state": {
-                            "description": "State payload to include in fingerprint computation."
+                            "type": "object",
+                            "description": "State payload dictionary to include in fingerprint computation.",
                         },
                         "questions": {
-                            "description": "Question definitions dictionary or list.",
-                            "oneOf": [{"type": "object"}, {"type": "array"}],
+                            "type": "object",
+                            "description": "Question definitions dictionary (optional).",
                         },
                         "model": {
                             "type": "string",
@@ -1288,9 +1291,11 @@ class ToolRegistry:
         except Exception as err:
             logger.warning("Error in jevguard_prune_state: %s", err)
             return {
+                "status": "error",
                 "success": False,
                 "error_type": type(err).__name__,
                 "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
                 "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
 
@@ -1335,9 +1340,11 @@ class ToolRegistry:
         except Exception as err:
             logger.warning("Error in jevguard_cache_fingerprint: %s", err)
             return {
+                "status": "error",
                 "success": False,
                 "error_type": type(err).__name__,
                 "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
                 "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
 
@@ -1368,9 +1375,11 @@ class ToolRegistry:
         except Exception as err:
             logger.warning("Error in jevguard_calibrate: %s", err)
             return {
+                "status": "error",
                 "success": False,
                 "error_type": type(err).__name__,
                 "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
                 "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
 
@@ -1447,10 +1456,12 @@ class ToolRegistry:
                 raw_answers = dispatch_res.get("data", {}).get("answers", {})
             else:
                 return {
+                    "status": "error",
                     "success": False,
                     "error": "TYPESAFE_API_KEY not configured in MCP settings or environment",
                     "error_type": "ConfigurationError",
                     "message": "TYPESAFE_API_KEY not configured in MCP settings or environment",
+                    "verdict": "MANUAL_REVIEW_REQUIRED",
                     "fallback_action": "MANUAL_REVIEW_REQUIRED",
                     "cache_fingerprint": fingerprint,
                     "wire_payload": wire_payload,
@@ -1495,9 +1506,11 @@ class ToolRegistry:
         except Exception as err:
             logger.warning("Error in jevguard_evaluate: %s", err)
             return {
+                "status": "error",
                 "success": False,
                 "error_type": type(err).__name__,
                 "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
                 "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
 
@@ -1567,9 +1580,11 @@ class ToolRegistry:
 
             if not eval_res.get("success", False):
                 return {
+                    "status": "error",
                     "success": False,
                     "error_type": eval_res.get("error_type", "EvaluationError"),
                     "message": eval_res.get("message") or eval_res.get("error", "Evaluation failed"),
+                    "verdict": "MANUAL_REVIEW_REQUIRED",
                     "fallback_action": "MANUAL_REVIEW_REQUIRED",
                     "policy": "REQUIRE_HUMAN_APPROVAL",
                     "command": command,
@@ -1623,9 +1638,11 @@ class ToolRegistry:
         except Exception as err:
             logger.warning("Error evaluating command safety: %s", err)
             return {
+                "status": "error",
                 "success": False,
                 "error_type": type(err).__name__,
                 "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
                 "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
 
@@ -1704,9 +1721,11 @@ class ToolRegistry:
 
             if not eval_res.get("success", False):
                 return {
+                    "status": "error",
                     "success": False,
                     "error_type": eval_res.get("error_type", "EvaluationError"),
                     "message": eval_res.get("message") or eval_res.get("error", "Evaluation failed"),
+                    "verdict": "MANUAL_REVIEW_REQUIRED",
                     "fallback_action": "MANUAL_REVIEW_REQUIRED",
                     "approved": False,
                     "recommendation": "REQUEST_CHANGES",
@@ -1775,9 +1794,11 @@ class ToolRegistry:
         except Exception as err:
             logger.warning("Error verifying code patch: %s", err)
             return {
+                "status": "error",
                 "success": False,
                 "error_type": type(err).__name__,
                 "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
                 "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
 
@@ -1840,9 +1861,11 @@ class ToolRegistry:
 
             if not eval_res.get("success", False):
                 return {
+                    "status": "error",
                     "success": False,
                     "error_type": eval_res.get("error_type", "EvaluationError"),
                     "message": eval_res.get("message") or eval_res.get("error", "Evaluation failed"),
+                    "verdict": "MANUAL_REVIEW_REQUIRED",
                     "fallback_action": "MANUAL_REVIEW_REQUIRED",
                     "decision_question": decision_question,
                     "options": options,
@@ -1876,9 +1899,11 @@ class ToolRegistry:
         except Exception as err:
             logger.warning("Error evaluating decision: %s", err)
             return {
+                "status": "error",
                 "success": False,
                 "error_type": type(err).__name__,
                 "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
                 "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
 

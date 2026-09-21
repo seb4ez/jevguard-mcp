@@ -244,9 +244,11 @@ class MCPServer:
             }
         except Exception as err:
             err_dict = {
+                "status": "error",
                 "success": False,
                 "error_type": type(err).__name__,
                 "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
                 "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
             return {

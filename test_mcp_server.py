@@ -1385,8 +1385,10 @@ class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
 
             content = json.loads(resp["result"]["content"][0]["text"])
             self.assertFalse(content["success"])
+            self.assertEqual(content["status"], "error")
             self.assertEqual(content["error_type"], "RuntimeError")
             self.assertEqual(content["message"], "Simulated upstream gateway timeout")
+            self.assertEqual(content["verdict"], "MANUAL_REVIEW_REQUIRED")
             self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
 
     def test_all_atomic_tools_without_api_key_return_structured_error(self):
@@ -1409,7 +1411,9 @@ class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
                 self.assertFalse(resp.get("result", {}).get("isError", True))
                 content = json.loads(resp["result"]["content"][0]["text"])
                 self.assertFalse(content["success"])
+                self.assertEqual(content["status"], "error")
                 self.assertEqual(content["error_type"], "ConfigurationError")
+                self.assertEqual(content["verdict"], "MANUAL_REVIEW_REQUIRED")
                 self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
 
 
