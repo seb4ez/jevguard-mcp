@@ -1,6 +1,6 @@
 # JevGuard MCP Server
 
-Official Model Context Protocol (MCP) server for JevGuard, the deterministic evaluation and certainty calibration runtime for TypeSafe AI.
+Official Model Context Protocol (MCP) server for JevGuard, providing a deterministic local caching, state sanitization, and guardrail layer for TypeSafe AI's System One decision model.
 
 This package exposes core JevGuard primitives through JSON-RPC 2.0 over standard input/output (stdio), adhering to the MCP 2024-11-05 specification.
 
@@ -8,20 +8,20 @@ This package exposes core JevGuard primitives through JSON-RPC 2.0 over standard
 
 1. Zero External Dependencies: Implemented strictly with the Python standard library (`sys`, `json`, `sqlite3`, `hashlib`, `urllib`).
 2. Protocol Fidelity: Full compliance with the MCP 2024-11-05 standard, supporting initialize handshakes, ping, tool discovery, and tool execution.
-3. Deterministic Execution: State sanitization, closed-world neutral escape injection, probability dispersion analysis, and SHA-256 fingerprint caching.
+3. Deterministic Local Layer: Canonical state sanitization, neutral escape injection, probability dispersion analysis, and SHA-256 fingerprint caching in SQLite.
 4. Process Isolation: Runs as an independent stdio subprocess compatible with Claude Desktop, Cursor IDE, LibreChat, and custom MCP clients.
 
-## Empirical Benchmark (5 Vanilla vs 5 JevGuard MCP)
+## Live Verification Benchmark (5 Direct Calls vs 5 JevGuard MCP Calls)
 
-A live benchmark was conducted directly against the official TypeSafe AI endpoint (`https://api.typesafe.ai/v1/systemone`, model `jev-latest`) comparing 5 vanilla API calls against 5 JevGuard MCP tool calls.
+A live comparison was conducted directly against the official TypeSafe AI endpoint (`https://api.typesafe.ai/v1/systemone`, model `jev-latest`) comparing 5 direct API calls against 5 JevGuard MCP tool calls from a development workstation.
 
 ![JevGuard MCP Benchmark](benchmark_results.png)
 
-### Key Empirical Findings
+### Key Empirical Observations
 
-1. Deterministic Cache Speedup (0.099 ms): Repeated queries containing dynamic timestamps and trace IDs are intercepted locally. Volatile key masking matches the canonical SHA-256 fingerprint, resulting in a 7,400x speedup and 0 tokens consumed.
-2. Closed-World Trap Mitigation: In Scenario 3 (an off-topic inquiry about corporate tax offices in Zurich), Vanilla TypeSafe AI forced an arbitrary classification (`credit_card_chargeback`). JevGuard MCP automatically injected `UNRESOLVED_OR_OTHER`, safely catching the out-of-distribution input with 100% certainty.
-3. Ambiguity Calibration: In Scenario 1, boundary uncertainty on `is_outage` (`noul=0.49`, distance 0.01 to threshold) and flat distribution on `severity` (0.08 gap) were detected and flagged as `AMBIGUOUS_STATE`.
+1. Local Cache Retrieval (0.099 ms): Repeated queries containing dynamic timestamps and trace IDs are intercepted locally. Volatile key masking matches the canonical SHA-256 fingerprint, avoiding WAN network roundtrips (~740 ms) and billing 0 tokens on cache hits.
+2. Closed-World Trap Mitigation: In Scenario 3 (an off-topic inquiry about corporate tax offices in Zurich), the unguided model forced a classification (`credit_card_chargeback`). JevGuard MCP injected `UNRESOLVED_OR_OTHER`, routing the off-topic input to the neutral escape option.
+3. Ambiguity Calibration: In Scenario 1, boundary uncertainty on `is_outage` (`noul=0.49`, distance 0.01 to threshold) and flat distribution on `severity` (0.08 gap) were flagged as `AMBIGUOUS_STATE` using default operational heuristics.
 4. Standard Library Overhead: Local middleware execution latency remained below 0.3 ms for cold requests and 0.099 ms for warm cache lookups.
 
 ## Available Tools
@@ -193,6 +193,15 @@ Run the unit tests with Python's standard `unittest` runner:
 ```bash
 python -m unittest test_mcp_server.py -v
 ```
+
+## Project Status and Validation Transparency
+
+JevGuard MCP is an independent open-source runtime (v1.0.0) built solely with the Python standard library. Initial design and test suites were developed iteratively using AI assistance and local unit test harnesses.
+
+Key engineering notes:
+- The local server (protocol serialization, SQLite caching, state pruning, and calibration checks) is deterministic, while upstream evaluations from TypeSafe AI / Jev are probabilistic.
+- Default calibration thresholds (e.g. top probability below 0.40, margin below 0.15) represent operational heuristics for tie and uncertainty detection rather than parameters fitted on a specific domain corpus.
+- We welcome community peer review, external testing, and issue reports.
 
 ## License
 
