@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import urllib.error
 from unittest import mock
 
 # Enable test mode for test suite execution to permit test mock answers
@@ -235,14 +236,14 @@ class TestCacheFingerprint(unittest.TestCase):
     def test_volatile_key_masking(self):
         state_1 = {
             "user_id": "usr_100",
-            "created_at": 1726780000,
+            "timestamp": 1726780000,
             "trace_id": "trace-abc-001",
             "request-id": "req-999",
             "action": "execute",
         }
         state_2 = {
             "user_id": "usr_100",
-            "created_at": 1726799999,
+            "timestamp": 1726799999,
             "trace_id": "trace-xyz-999",
             "request-id": "req-000",
             "action": "execute",
@@ -415,7 +416,7 @@ class TestToolsCallExecution(unittest.TestCase):
         self.assertEqual(data["summary"]["verdict"], "AMBIGUOUS_STATE")
 
     def test_call_evaluate_tool_with_mock_answers_and_cache(self):
-        state = {"order_id": "ord_101", "created_at": 1726700000}
+        state = {"order_id": "ord_101", "timestamp": 1726700000}
         questions = {
             "classification": {
                 "type": "choice",
@@ -463,7 +464,7 @@ class TestToolsCallExecution(unittest.TestCase):
         self.assertEqual(data2["cache_fingerprint"], data1["cache_fingerprint"])
 
         # Third call with updated volatile timestamp should still hit cache
-        state_updated_time = {"order_id": "ord_101", "created_at": 1726999999}
+        state_updated_time = {"order_id": "ord_101", "timestamp": 1726999999}
         call_msg["id"] = 15
         call_msg["params"]["arguments"]["state"] = state_updated_time
         resp3 = self.server.handle_message(call_msg)
@@ -781,7 +782,7 @@ class TestAuditPoint2MissingEnvVariables(unittest.TestCase):
 
         resp = self.server.handle_message(call_msg)
         self.assertIsNotNone(resp)
-        self.assertFalse(resp.get("result", {}).get("isError", True))
+        self.assertTrue(resp.get("result", {}).get("isError", False))
         content = json.loads(resp["result"]["content"][0]["text"])
 
         self.assertFalse(content["success"])
@@ -1126,7 +1127,7 @@ class TestAtomicToolsProtocol(unittest.TestCase):
 
         resp = self.server.handle_message(call_msg)
         self.assertIsNotNone(resp)
-        self.assertFalse(resp.get("result", {}).get("isError", True))
+        self.assertTrue(resp.get("result", {}).get("isError", False))
 
         content = json.loads(resp["result"]["content"][0]["text"])
         self.assertFalse(content["success"])
@@ -1273,7 +1274,7 @@ class TestAtomicToolsProtocol(unittest.TestCase):
         }
 
         resp = self.server.handle_message(call_msg)
-        self.assertFalse(resp.get("result", {}).get("isError", True))
+        self.assertTrue(resp.get("result", {}).get("isError", False))
         content = json.loads(resp["result"]["content"][0]["text"])
         self.assertFalse(content["success"])
         self.assertEqual(content["error_type"], "ValueError")
@@ -1370,7 +1371,7 @@ class TestAtomicToolsProtocol(unittest.TestCase):
         }
 
         resp = self.server.handle_message(call_msg)
-        self.assertFalse(resp.get("result", {}).get("isError", True))
+        self.assertTrue(resp.get("result", {}).get("isError", False))
         content = json.loads(resp["result"]["content"][0]["text"])
         self.assertFalse(content["success"])
         self.assertEqual(content["error_type"], "ValueError")
@@ -1396,7 +1397,7 @@ class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
             }
             resp = self.server.handle_message(call_msg)
             self.assertIsNotNone(resp)
-            self.assertFalse(resp.get("result", {}).get("isError", True))
+            self.assertTrue(resp.get("result", {}).get("isError", False))
 
             content = json.loads(resp["result"]["content"][0]["text"])
             self.assertFalse(content["success"])
@@ -1423,7 +1424,7 @@ class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
                 }
                 resp = self.server.handle_message(call_msg)
                 self.assertIsNotNone(resp)
-                self.assertFalse(resp.get("result", {}).get("isError", True))
+                self.assertTrue(resp.get("result", {}).get("isError", False))
                 content = json.loads(resp["result"]["content"][0]["text"])
                 self.assertFalse(content["success"])
                 self.assertEqual(content["status"], "error")
@@ -1596,6 +1597,147 @@ class TestSecurityHardeningAndAudit(unittest.TestCase):
             ignore_keys=["tenant_id"],
         )
         self.assertEqual(fp1, fp2, "Both custom key tenant_id and default timestamp must be ignored")
+
+    def test_ssrf_urlparse_userinfo_spoof_blocked(self):
+        registry = ToolRegistry(allow_test_mocks=True)
+        with self.assertRaises(PermissionError):
+            registry._dispatch_upstream(
+                endpoint="https://api.typesafe.ai@evil.com/v1/systemone",
+                api_key="secret_test_key",
+                payload={"test": 1},
+            )
+
+    def test_ssrf_subdomain_spoof_blocked(self):
+        registry = ToolRegistry(allow_test_mocks=True)
+        with self.assertRaises(PermissionError):
+            registry._dispatch_upstream(
+                endpoint="https://api.typesafe.ai.evil.com/v1/systemone",
+                api_key="secret_test_key",
+                payload={"test": 1},
+            )
+
+    def test_http_redirect_raises_blocked_error(self):
+        from jevguard_mcp.tools import NoRedirectHandler
+        handler = NoRedirectHandler()
+        with self.assertRaises(urllib.error.HTTPError) as ctx:
+            handler.redirect_request(None, None, 301, "Moved Permanently", {}, "https://evil.com/redirected")
+        self.assertEqual(ctx.exception.code, 301)
+        self.assertIn("blocked for security", str(ctx.exception.reason))
+
+    def test_unrecognized_arguments_rejected_with_validation_error(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=False)
+            res = registry.execute_tool(
+                "evaluate_command_safety",
+                {
+                    "command": "ls -la",
+                    "injected_custom_param": "malicious_payload",
+                },
+            )
+            self.assertFalse(res["success"])
+            self.assertEqual(res["error_type"], "ValidationError")
+            self.assertIn("injected_custom_param", res["message"])
+
+    def test_api_key_and_endpoint_rejected_as_unrecognized_in_public_tools(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=False)
+            res = registry.execute_tool(
+                "evaluate_command_safety",
+                {
+                    "command": "git status",
+                    "api_key": "stolen_key",
+                    "endpoint": "https://attacker.com",
+                },
+            )
+            self.assertFalse(res["success"])
+            self.assertEqual(res["error_type"], "ValidationError")
+            self.assertIn("api_key", res["message"])
+
+    def test_created_at_and_updated_at_not_masked_by_default(self):
+        fp1 = DeterministicCache.compute_fingerprint(
+            model="jev-latest",
+            state={"order_id": "ord_100", "created_at": 1000, "updated_at": 1000},
+        )
+        fp2 = DeterministicCache.compute_fingerprint(
+            model="jev-latest",
+            state={"order_id": "ord_100", "created_at": 2000, "updated_at": 2000},
+        )
+        self.assertNotEqual(fp1, fp2, "created_at and updated_at must NOT be masked by default to prevent database collisions")
+
+    def test_command_and_patch_content_whitespace_literal_preservation(self):
+        cmd = 'rm -rf "/tmp/a  b"'
+        patch = (
+            " --- a/calc.py\n"
+            "+++ b/calc.py\n"
+            "@@ -1,3 +1,3 @@\n"
+            " def add(a, b):\n"
+            " \n"
+            "+    return a + b"
+        )
+        registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=True)
+        res_cmd = registry.execute_tool(
+            "evaluate_command_safety",
+            {
+                "command": cmd,
+                "mock_answers": {
+                    "is_destructive": {"type": "noul", "noul": 0.05},
+                    "risk_score": {"type": "score", "score": 1, "confidence": 0.95},
+                    "execution_policy": {"type": "choice", "choice": "ALLOW_AUTONOMOUS", "confidence": 0.95},
+                },
+            },
+        )
+        self.assertTrue(res_cmd["success"])
+        self.assertEqual(res_cmd["command"], cmd)
+
+        res_patch = registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": patch,
+                "target_file": "calc.py",
+                "mock_answers": {
+                    "has_regression": {"type": "noul", "noul": 0.05},
+                    "risk_score": {"type": "score", "score": 1, "confidence": 0.95},
+                    "recommendation": {"type": "choice", "choice": "APPROVE", "confidence": 0.95},
+                },
+            },
+        )
+        self.assertTrue(res_patch["success"])
+        self.assertTrue(res_patch["approved"])
+
+    def test_safety_invariant_ambiguity_or_missing_noul_never_allows_autonomous(self):
+        registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=True)
+        # Even if the model choice is ALLOW_AUTONOMOUS, ambiguity MUST force REQUIRE_HUMAN_APPROVAL
+        res_cmd = registry.execute_tool(
+            "evaluate_command_safety",
+            {
+                "command": "git pull",
+                "mock_answers": {
+                    "is_destructive": {"type": "noul", "noul": 0.45},  # Boundary uncertainty
+                    "risk_score": {"type": "score", "score": 2, "confidence": 0.50},
+                    "execution_policy": {"type": "choice", "choice": "ALLOW_AUTONOMOUS", "confidence": 0.95},
+                },
+            },
+        )
+        self.assertTrue(res_cmd["success"])
+        self.assertEqual(res_cmd["policy"], "REQUIRE_HUMAN_APPROVAL")
+        self.assertTrue(res_cmd["verdict"]["requires_human"])
+
+        # In verify_code_patch, ambiguity MUST reject/request changes, NEVER approve
+        res_patch = registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "+def fix(): pass",
+                "target_file": "fix.py",
+                "mock_answers": {
+                    "has_regression": {"type": "noul", "noul": 0.48},  # Boundary uncertainty
+                    "risk_score": {"type": "score", "score": 1, "confidence": 0.95},
+                    "recommendation": {"type": "choice", "choice": "APPROVE", "confidence": 0.95},
+                },
+            },
+        )
+        self.assertTrue(res_patch["success"])
+        self.assertFalse(res_patch["approved"])
+        self.assertEqual(res_patch["recommendation"], "REQUEST_CHANGES")
 
 
 if __name__ == "__main__":

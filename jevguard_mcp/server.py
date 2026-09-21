@@ -223,6 +223,7 @@ class MCPServer:
         try:
             result_data = self.registry.execute_tool(name, arguments)
             result_text = json.dumps(result_data, indent=2, sort_keys=True, default=str)
+            is_error = not result_data.get("success", True) or result_data.get("status") == "error"
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -233,7 +234,7 @@ class MCPServer:
                             "text": result_text,
                         }
                     ],
-                    "isError": False,
+                    "isError": is_error,
                 },
             }
         except KeyError as err:
@@ -269,7 +270,7 @@ class MCPServer:
                             "text": json.dumps(err_dict, indent=2, sort_keys=True, default=str),
                         }
                     ],
-                    "isError": False,
+                    "isError": True,
                 },
             }
 

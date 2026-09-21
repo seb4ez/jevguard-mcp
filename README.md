@@ -85,9 +85,10 @@ Sanitizes structured input states:
 
 #### 7. `jevguard_cache_fingerprint`
 Calculates a canonical SHA-256 fingerprint:
-- Recursively strips volatile fields (`timestamp`, `trace_id`, `request_id`, `created_at`, `updated_at`, `nonce`).
+- Recursively strips volatile ephemeral request fields (`timestamp`, `trace_id`, `span_id`, `request_id`, `correlation_id`, `nonce`).
 - Orders dictionary keys deterministically.
-- Produces identical hashes for semantically identical states regardless of key ordering or volatile timestamp variance.
+- Produces identical hashes for semantically identical states regardless of key ordering or ephemeral trace variance.
+- Preserves domain date/time attributes (`created_at`, `updated_at`) by default to prevent version collisions.
 
 ## Robustness & Fault Tolerance
 
@@ -97,9 +98,14 @@ Calculates a canonical SHA-256 fingerprint:
    - Any unrecoverable lock, filesystem, or permission error transparently degrades to shared `:memory:` without crashing or aborting execution.
 
 2. **Structured Exception Handling & Protocol Stability**:
-   - All tool executions are wrapped in defensive error-handling handlers.
+   - All tool executions are wrapped in defensive error handlers.
    - Failures (HTTP errors, timeouts, network interruptions, validation errors) return actionable JSON text payloads with `"fallback_action": "MANUAL_REVIEW_REQUIRED"`.
-   - The MCP JSON-RPC connection remains active (`isError: false` on structured payloads) so client environments (Cursor, Claude Desktop, Antigravity) never disconnect unexpectedly.
+   - Tool failures return actionable structured JSON error payloads with standard MCP `isError: true`, while keeping the stdio transport cleanly connected so client environments (Cursor, Claude Desktop, Antigravity) never crash or drop sessions.
+
+3. **Third-Party Data Transmission Disclosure**:
+   - Live evaluations (cache misses or `bypass_cache=True`) transmit the evaluated `command`, `patch_content`, or `state` payload over encrypted HTTPS directly to the official TypeSafe AI endpoint (`api.typesafe.ai`).
+   - Ephemeral headers and keys are never forwarded across redirect chains (`NoRedirectHandler` blocks 301/302/303 redirect leakage).
+   - When deterministic cache hits occur, zero tokens are consumed and zero bytes leave the local host.
 
 ## Installation
 

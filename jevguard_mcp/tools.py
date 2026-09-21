@@ -19,6 +19,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Union
 
@@ -44,15 +45,11 @@ ESCAPE_CANDIDATE_KEYS: Set[str] = {
 
 DEFAULT_VOLATILE_KEYS: Set[str] = {
     "timestamp",
-    "created_at",
-    "updated_at",
     "trace_id",
     "span_id",
     "request_id",
     "correlation_id",
     "nonce",
-    "createdat",
-    "updatedat",
     "traceid",
     "requestid",
     "x_trace_id",
@@ -63,6 +60,48 @@ DEFAULT_VOLATILE_KEYS: Set[str] = {
 }
 
 
+class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuses to follow HTTP redirects to prevent authorization header leakage."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            newurl, code, f"HTTP redirect ({code}) to '{newurl}' blocked for security.", headers, fp
+        )
+
+
+def is_authorized_endpoint(endpoint: str) -> bool:
+    """Strictly validates that endpoint targets an authorized TypeSafe AI hostname without userinfo or spoofing."""
+    try:
+        parsed = urllib.parse.urlsplit(endpoint.strip())
+    except Exception:
+        return False
+
+    if parsed.scheme != "https":
+        return False
+
+    if parsed.username or parsed.password:
+        return False
+
+    hostname = (parsed.hostname or "").lower().strip()
+    if not hostname:
+        return False
+
+    allowed_hosts = {"api.typesafe.ai", "typesafe.ai"}
+    custom_allowed = os.environ.get("JEVGUARD_ALLOWED_ENDPOINTS", "")
+    if custom_allowed:
+        for entry in custom_allowed.split(","):
+            entry = entry.strip()
+            if entry:
+                try:
+                    custom_parsed = urllib.parse.urlsplit(entry if "://" in entry else f"https://{entry}")
+                    if custom_parsed.hostname:
+                        allowed_hosts.add(custom_parsed.hostname.lower())
+                except Exception:
+                    pass
+
+    return hostname in allowed_hosts
+
+
 class StatePruner:
     """Removes empty values, nulls, and duplicate whitespace while preventing cycles."""
 
@@ -71,6 +110,7 @@ class StatePruner:
         cls,
         data: Any,
         prune_lists: bool = False,
+        collapse_whitespace: bool = True,
         seen: Optional[Set[int]] = None,
     ) -> Any:
         if seen is None:
@@ -91,7 +131,7 @@ class StatePruner:
                     if value is None:
                         continue
                     str_key = str(key)
-                    pruned_value = cls.prune(value, prune_lists=prune_lists, seen=seen)
+                    pruned_value = cls.prune(value, prune_lists=prune_lists, collapse_whitespace=collapse_whitespace, seen=seen)
                     if pruned_value is None:
                         continue
                     if isinstance(pruned_value, (str, dict, list, tuple, set, frozenset)) and len(pruned_value) == 0:
@@ -105,7 +145,7 @@ class StatePruner:
                     for item in data:
                         if item is None:
                             continue
-                        pruned_item = cls.prune(item, prune_lists=prune_lists, seen=seen)
+                        pruned_item = cls.prune(item, prune_lists=prune_lists, collapse_whitespace=collapse_whitespace, seen=seen)
                         if pruned_item is None:
                             continue
                         if isinstance(pruned_item, (str, dict)) and len(pruned_item) == 0:
@@ -113,13 +153,13 @@ class StatePruner:
                         pruned_list.append(pruned_item)
                     return pruned_list
                 else:
-                    return [cls.prune(item, prune_lists=prune_lists, seen=seen) for item in data]
+                    return [cls.prune(item, prune_lists=prune_lists, collapse_whitespace=collapse_whitespace, seen=seen) for item in data]
 
             elif isinstance(data, tuple):
-                return tuple(cls.prune(item, prune_lists=prune_lists, seen=seen) for item in data)
+                return tuple(cls.prune(item, prune_lists=prune_lists, collapse_whitespace=collapse_whitespace, seen=seen) for item in data)
 
             elif isinstance(data, (set, frozenset)):
-                pruned_items = [cls.prune(item, prune_lists=prune_lists, seen=seen) for item in data]
+                pruned_items = [cls.prune(item, prune_lists=prune_lists, collapse_whitespace=collapse_whitespace, seen=seen) for item in data]
                 try:
                     return sorted(pruned_items)
                 except TypeError:
@@ -131,10 +171,11 @@ class StatePruner:
                 return data
 
             elif isinstance(data, str):
-                if "\n" in data or "\r" in data:
-                    lines = [line.rstrip() for line in data.strip().splitlines()]
-                    return "\n".join(lines)
-                return " ".join(data.strip().split())
+                if collapse_whitespace:
+                    if "\n" in data or "\r" in data:
+                        return data
+                    return " ".join(data.strip().split())
+                return data
 
             return data
         finally:
@@ -207,11 +248,11 @@ class DeterministicCache:
             try:
                 self.ttl_seconds = float(raw_ttl)
             except (ValueError, TypeError):
-                self.ttl_seconds = 86400.0
+                self.ttl_seconds = 3600.0
         elif ttl_seconds is not None:
             self.ttl_seconds = float(ttl_seconds)
         else:
-            self.ttl_seconds = 86400.0
+            self.ttl_seconds = 3600.0
 
         self.default_ignore_keys = (
             set(DEFAULT_VOLATILE_KEYS).union({str(k).strip().lower().replace("-", "_") for k in default_ignore_keys})
@@ -1156,7 +1197,7 @@ class ToolRegistry:
                         "bypass_cache": {
                             "type": "boolean",
                             "description": "Bypass deterministic cache lookup.",
-                            "default": False,
+                            "default": True,
                         },
                     },
                     "required": ["command"],
@@ -1193,7 +1234,7 @@ class ToolRegistry:
                         "bypass_cache": {
                             "type": "boolean",
                             "description": "Bypass deterministic cache lookup.",
-                            "default": False,
+                            "default": True,
                         },
                     },
                     "required": ["patch_content", "target_file"],
@@ -1237,13 +1278,23 @@ class ToolRegistry:
             },
         ]
 
+    def get_tool_allowed_properties(self, tool_name: str) -> Optional[Set[str]]:
+        for item in self.get_definitions():
+            if item.get("name") == tool_name:
+                schema = item.get("inputSchema", {})
+                props = schema.get("properties", {})
+                return set(props.keys())
+        return None
+
     def execute_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         with self._lock:
             if not isinstance(arguments, dict):
                 return {
+                    "status": "error",
                     "success": False,
                     "error_type": "ValueError",
                     "message": f"Tool arguments must be a dictionary, got {type(arguments).__name__}",
+                    "verdict": "MANUAL_REVIEW_REQUIRED",
                     "fallback_action": "MANUAL_REVIEW_REQUIRED",
                 }
 
@@ -1260,15 +1311,53 @@ class ToolRegistry:
             if name not in handler_map:
                 raise KeyError(f"Unknown tool: '{name}'")
 
+            allowed_keys = self.get_tool_allowed_properties(name)
+            if allowed_keys is not None:
+                is_test = self.allow_test_mocks or (os.environ.get("JEVGUARD_TEST_MODE") == "1")
+                extra_keys = set(arguments.keys()) - allowed_keys
+                if not is_test:
+                    if "mock_answers" in extra_keys or "_mock_answers" in extra_keys:
+                        return {
+                            "status": "error",
+                            "success": False,
+                            "error_type": "SecurityError",
+                            "message": "Direct mock_answers injection is forbidden in production MCP server.",
+                            "verdict": "MANUAL_REVIEW_REQUIRED",
+                            "fallback_action": "MANUAL_REVIEW_REQUIRED",
+                        }
+                    if extra_keys:
+                        return {
+                            "status": "error",
+                            "success": False,
+                            "error_type": "ValidationError",
+                            "message": f"Unrecognized arguments for tool '{name}': {sorted(list(extra_keys))}",
+                            "verdict": "MANUAL_REVIEW_REQUIRED",
+                            "fallback_action": "MANUAL_REVIEW_REQUIRED",
+                        }
+                else:
+                    test_allowed = {"mock_answers", "_mock_answers"}
+                    unrecognized = extra_keys - test_allowed
+                    if unrecognized:
+                        return {
+                            "status": "error",
+                            "success": False,
+                            "error_type": "ValidationError",
+                            "message": f"Unrecognized arguments for tool '{name}': {sorted(list(unrecognized))}",
+                            "verdict": "MANUAL_REVIEW_REQUIRED",
+                            "fallback_action": "MANUAL_REVIEW_REQUIRED",
+                        }
+
             handler = handler_map[name]
             try:
                 return handler(arguments)
             except Exception as err:
                 logger.warning("Tool execution error in '%s': %s", name, err)
                 return {
+                    "status": "error",
                     "success": False,
                     "error_type": type(err).__name__,
                     "message": str(err),
+                    "verdict": "MANUAL_REVIEW_REQUIRED",
                     "fallback_action": "MANUAL_REVIEW_REQUIRED",
                 }
 
@@ -1542,14 +1631,16 @@ class ToolRegistry:
 
             working_dir = str(arguments.get("working_dir", "") or "").strip()
             elevated = bool(arguments.get("elevated_privileges", False))
-            mock_answers = arguments.get("mock_answers")
-            api_key = arguments.get("api_key")
-            endpoint = arguments.get("endpoint", "https://api.typesafe.ai/v1/systemone")
+            mock_answers = (
+                arguments.get("mock_answers")
+                if (self.allow_test_mocks or os.environ.get("JEVGUARD_TEST_MODE") == "1")
+                else None
+            )
             timeout = float(arguments.get("timeout", 30.0))
-            bypass_cache = bool(arguments.get("bypass_cache", False))
+            bypass_cache = bool(arguments.get("bypass_cache", True))
 
             state = {
-                "command": command.strip(),
+                "command": command,
                 "working_dir": working_dir,
                 "elevated_privileges": elevated,
             }
@@ -1586,15 +1677,16 @@ class ToolRegistry:
                 },
             }
 
-            eval_res = self._tool_evaluate({
+            eval_payload = {
                 "state": state,
                 "questions": questions,
-                "mock_answers": mock_answers,
-                "api_key": api_key,
-                "endpoint": endpoint,
                 "timeout": timeout,
                 "bypass_cache": bypass_cache,
-            })
+            }
+            if mock_answers is not None:
+                eval_payload["mock_answers"] = mock_answers
+
+            eval_res = self._tool_evaluate(eval_payload)
 
             if not eval_res.get("success", False):
                 return {
@@ -1627,9 +1719,9 @@ class ToolRegistry:
 
             if raw_choice == "DENY_DESTRUCTIVE" or (noul_prob is not None and noul_prob >= 0.70):
                 policy = "DENY_DESTRUCTIVE"
-            elif elevated or has_ambiguity or raw_choice == "REQUIRE_HUMAN_APPROVAL" or (noul_prob is not None and noul_prob >= 0.35):
+            elif elevated or has_ambiguity or noul_prob is None or noul_prob >= 0.35 or raw_choice != "ALLOW_AUTONOMOUS":
                 policy = "REQUIRE_HUMAN_APPROVAL"
-            elif raw_choice == "ALLOW_AUTONOMOUS" and (noul_prob is None or noul_prob < 0.35) and not elevated:
+            elif raw_choice == "ALLOW_AUTONOMOUS" and not elevated and not has_ambiguity and (noul_prob is not None and noul_prob < 0.35):
                 policy = "ALLOW_AUTONOMOUS"
             else:
                 policy = "REQUIRE_HUMAN_APPROVAL"
@@ -1683,14 +1775,16 @@ class ToolRegistry:
             if risk_tolerance not in ("strict", "balanced", "permissive"):
                 raise ValueError("Argument 'risk_tolerance' must be one of: strict, balanced, permissive")
 
-            mock_answers = arguments.get("mock_answers")
-            api_key = arguments.get("api_key")
-            endpoint = arguments.get("endpoint", "https://api.typesafe.ai/v1/systemone")
+            mock_answers = (
+                arguments.get("mock_answers")
+                if (self.allow_test_mocks or os.environ.get("JEVGUARD_TEST_MODE") == "1")
+                else None
+            )
             timeout = float(arguments.get("timeout", 30.0))
-            bypass_cache = bool(arguments.get("bypass_cache", False))
+            bypass_cache = bool(arguments.get("bypass_cache", True))
 
             state = {
-                "patch_content": patch_content.strip(),
+                "patch_content": patch_content,
                 "target_file": target_file.strip(),
                 "risk_tolerance": risk_tolerance,
             }
@@ -1727,15 +1821,16 @@ class ToolRegistry:
                 },
             }
 
-            eval_res = self._tool_evaluate({
+            eval_payload = {
                 "state": state,
                 "questions": questions,
-                "mock_answers": mock_answers,
-                "api_key": api_key,
-                "endpoint": endpoint,
                 "timeout": timeout,
                 "bypass_cache": bypass_cache,
-            })
+            }
+            if mock_answers is not None:
+                eval_payload["mock_answers"] = mock_answers
+
+            eval_res = self._tool_evaluate(eval_payload)
 
             if not eval_res.get("success", False):
                 return {
@@ -1771,22 +1866,26 @@ class ToolRegistry:
                 rec = "REJECT"
                 approved = False
                 risk_level = "CRITICAL" if (noul_prob and noul_prob >= 0.85) else "HIGH"
-            elif has_ambiguity or raw_rec == "REQUEST_CHANGES" or (risk_tolerance == "strict" and (noul_prob is not None and noul_prob >= 0.20)):
+            elif has_ambiguity or noul_prob is None or raw_rec != "APPROVE":
                 rec = "REQUEST_CHANGES"
                 approved = False
                 risk_level = "MEDIUM"
-            elif raw_rec == "APPROVE" and not has_ambiguity and (noul_prob is None or noul_prob < 0.40):
-                rec = "APPROVE"
-                approved = True
-                risk_level = "LOW"
-            elif risk_tolerance == "permissive" and (noul_prob is None or noul_prob < 0.60):
-                rec = "APPROVE"
-                approved = True
-                risk_level = "LOW"
+            elif risk_tolerance == "strict" and noul_prob >= 0.20:
+                rec = "REQUEST_CHANGES"
+                approved = False
+                risk_level = "MEDIUM"
+            elif risk_tolerance == "balanced" and noul_prob >= 0.40:
+                rec = "REQUEST_CHANGES"
+                approved = False
+                risk_level = "MEDIUM"
+            elif risk_tolerance == "permissive" and noul_prob >= 0.60:
+                rec = "REQUEST_CHANGES"
+                approved = False
+                risk_level = "MEDIUM"
             else:
-                rec = "REQUEST_CHANGES"
-                approved = False
-                risk_level = "MEDIUM"
+                rec = "APPROVE"
+                approved = True
+                risk_level = "LOW"
 
             return {
                 "success": True,
@@ -1845,9 +1944,11 @@ class ToolRegistry:
             if len(options) < 1:
                 raise ValueError("Argument 'options' must contain at least one option")
 
-            mock_answers = arguments.get("mock_answers")
-            api_key = arguments.get("api_key")
-            endpoint = arguments.get("endpoint", "https://api.typesafe.ai/v1/systemone")
+            mock_answers = (
+                arguments.get("mock_answers")
+                if (self.allow_test_mocks or os.environ.get("JEVGUARD_TEST_MODE") == "1")
+                else None
+            )
             timeout = float(arguments.get("timeout", 30.0))
             bypass_cache = bool(arguments.get("bypass_cache", False))
 
@@ -1867,15 +1968,16 @@ class ToolRegistry:
                 }
             }
 
-            eval_res = self._tool_evaluate({
+            eval_payload = {
                 "state": state,
                 "questions": questions,
-                "mock_answers": mock_answers,
-                "api_key": api_key,
-                "endpoint": endpoint,
                 "timeout": timeout,
                 "bypass_cache": bypass_cache,
-            })
+            }
+            if mock_answers is not None:
+                eval_payload["mock_answers"] = mock_answers
+
+            eval_res = self._tool_evaluate(eval_payload)
 
             if not eval_res.get("success", False):
                 return {
@@ -1935,18 +2037,7 @@ class ToolRegistry:
         initial_backoff: float = 0.5,
     ) -> Dict[str, Any]:
         canonical_endpoint = str(endpoint).strip()
-        allowed = (
-            canonical_endpoint.startswith("https://api.typesafe.ai/")
-            or canonical_endpoint.startswith("https://typesafe.ai/")
-        )
-        custom_allowed = os.environ.get("JEVGUARD_ALLOWED_ENDPOINTS")
-        if custom_allowed:
-            for allowed_prefix in custom_allowed.split(","):
-                prefix = allowed_prefix.strip()
-                if prefix and canonical_endpoint.startswith(prefix):
-                    allowed = True
-                    break
-        if not allowed:
+        if not is_authorized_endpoint(canonical_endpoint):
             raise PermissionError(
                 f"Endpoint '{canonical_endpoint}' is not permitted. Only official TypeSafe AI endpoints or JEVGUARD_ALLOWED_ENDPOINTS are authorized."
             )
@@ -1960,6 +2051,7 @@ class ToolRegistry:
 
         attempts = 0
         max_attempts = max(1, max_retries + 1)
+        opener = urllib.request.build_opener(NoRedirectHandler())
 
         while attempts < max_attempts:
             attempts += 1
@@ -1967,7 +2059,7 @@ class ToolRegistry:
             t0 = time.perf_counter()
 
             try:
-                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                with opener.open(req, timeout=timeout) as resp:
                     t1 = time.perf_counter()
                     latency_ms = round((t1 - t0) * 1000, 3)
                     body = resp.read().decode("utf-8", errors="replace")
