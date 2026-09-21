@@ -11,7 +11,14 @@ import sys
 import threading
 from typing import Any, Dict, Optional, TextIO
 
-from .tools import ToolRegistry, get_default_cache_db_path
+try:
+    from .tools import ToolRegistry, get_default_cache_db_path
+except (ImportError, ValueError):
+    from pathlib import Path
+    pkg_root = str(Path(__file__).resolve().parent.parent)
+    if pkg_root not in sys.path:
+        sys.path.insert(0, pkg_root)
+    from jevguard_mcp.tools import ToolRegistry, get_default_cache_db_path
 
 logger = logging.getLogger("jevguard.mcp.server")
 logger.addHandler(logging.NullHandler())
