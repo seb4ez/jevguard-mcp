@@ -44,7 +44,6 @@ ESCAPE_CANDIDATE_KEYS: Set[str] = {
 
 DEFAULT_VOLATILE_KEYS: Set[str] = {
     "timestamp",
-    "time",
     "created_at",
     "updated_at",
     "trace_id",
@@ -132,6 +131,9 @@ class StatePruner:
                 return data
 
             elif isinstance(data, str):
+                if "\n" in data or "\r" in data:
+                    lines = [line.rstrip() for line in data.strip().splitlines()]
+                    return "\n".join(lines)
                 return " ".join(data.strip().split())
 
             return data
@@ -196,13 +198,25 @@ class DeterministicCache:
         db_path: Optional[str] = None,
         max_memory_items: int = 500,
         default_ignore_keys: Optional[Iterable[str]] = None,
+        ttl_seconds: Optional[float] = None,
     ):
         self.db_path = get_default_cache_db_path(db_path)
         self.max_memory_items = max_memory_items
+        raw_ttl = os.environ.get("JEVGUARD_CACHE_TTL")
+        if raw_ttl is not None:
+            try:
+                self.ttl_seconds = float(raw_ttl)
+            except (ValueError, TypeError):
+                self.ttl_seconds = 86400.0
+        elif ttl_seconds is not None:
+            self.ttl_seconds = float(ttl_seconds)
+        else:
+            self.ttl_seconds = 86400.0
+
         self.default_ignore_keys = (
-            {str(k).strip().lower().replace("-", "_") for k in default_ignore_keys}
+            set(DEFAULT_VOLATILE_KEYS).union({str(k).strip().lower().replace("-", "_") for k in default_ignore_keys})
             if default_ignore_keys is not None
-            else DEFAULT_VOLATILE_KEYS
+            else set(DEFAULT_VOLATILE_KEYS)
         )
         self._memory_lru: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
@@ -397,9 +411,9 @@ class DeterministicCache:
         target_questions = wire_questions if wire_questions is not None else {}
 
         keys_to_ignore = (
-            {str(k).strip().lower().replace("-", "_") for k in ignore_keys}
+            set(DEFAULT_VOLATILE_KEYS).union({str(k).strip().lower().replace("-", "_") for k in ignore_keys})
             if ignore_keys is not None
-            else DEFAULT_VOLATILE_KEYS
+            else set(DEFAULT_VOLATILE_KEYS)
         )
         filtered_state = (
             cls._strip_volatile_keys(target_state, keys_to_ignore)
@@ -424,28 +438,37 @@ class DeterministicCache:
     def get(self, fingerprint: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             if fingerprint in self._memory_lru:
-                self.stats["hits"] += 1
                 item = self._memory_lru[fingerprint]
-                self.stats["tokens_saved"] += item.get("tokens_estimate", 0)
-                tokens = item.get("tokens_estimate", 0)
-                self._promote_lru(fingerprint, item["data"], tokens)
-                return item["data"]
+                entry_time = item.get("created_at", 0.0)
+                if self.ttl_seconds > 0 and (time.time() - entry_time) > self.ttl_seconds:
+                    del self._memory_lru[fingerprint]
+                else:
+                    self.stats["hits"] += 1
+                    tokens = item.get("tokens_estimate", 0)
+                    self.stats["tokens_saved"] += tokens
+                    self._promote_lru(fingerprint, item["data"], tokens, created_at=entry_time)
+                    return item["data"]
 
         try:
             with self._get_connection() as conn:
                 cur = conn.execute(
-                    "SELECT response_json, tokens_estimate FROM evaluation_cache WHERE fingerprint = ?",
+                    "SELECT response_json, tokens_estimate, created_at FROM evaluation_cache WHERE fingerprint = ?",
                     (fingerprint,),
                 )
                 row = cur.fetchone()
                 if row:
-                    with self._lock:
-                        self.stats["hits"] += 1
-                        data = json.loads(row["response_json"])
-                        tokens = row["tokens_estimate"]
-                        self.stats["tokens_saved"] += tokens
-                        self._promote_lru(fingerprint, data, tokens)
-                    return data
+                    entry_created_at = row["created_at"]
+                    if self.ttl_seconds > 0 and (time.time() - entry_created_at) > self.ttl_seconds:
+                        conn.execute("DELETE FROM evaluation_cache WHERE fingerprint = ?", (fingerprint,))
+                        conn.commit()
+                    else:
+                        with self._lock:
+                            self.stats["hits"] += 1
+                            data = json.loads(row["response_json"])
+                            tokens = row["tokens_estimate"]
+                            self.stats["tokens_saved"] += tokens
+                            self._promote_lru(fingerprint, data, tokens, created_at=entry_created_at)
+                        return data
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
             logger.warning("Cache lookup database error for %s: %s. Falling back to :memory:.", fingerprint, err)
             self._fallback_to_memory()
@@ -463,6 +486,7 @@ class DeterministicCache:
         response_data: Dict[str, Any],
         input_tokens_estimate: int = 0,
     ) -> None:
+        now = time.time()
         try:
             raw_json = json.dumps(response_data, separators=(",", ":"), default=str)
             with self._get_connection() as conn:
@@ -476,7 +500,7 @@ class DeterministicCache:
                         fingerprint,
                         model,
                         raw_json,
-                        time.time(),
+                        now,
                         fingerprint,
                         input_tokens_estimate,
                     ),
@@ -484,7 +508,7 @@ class DeterministicCache:
                 conn.commit()
 
             with self._lock:
-                self._promote_lru(fingerprint, response_data, input_tokens_estimate)
+                self._promote_lru(fingerprint, response_data, input_tokens_estimate, created_at=now)
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
             logger.warning("Cache write database error for %s: %s. Falling back to :memory:.", fingerprint, err)
             self._fallback_to_memory()
@@ -500,14 +524,14 @@ class DeterministicCache:
                             fingerprint,
                             model,
                             raw_json,
-                            time.time(),
+                            now,
                             fingerprint,
                             input_tokens_estimate,
                         ),
                     )
                     conn.commit()
                 with self._lock:
-                    self._promote_lru(fingerprint, response_data, input_tokens_estimate)
+                    self._promote_lru(fingerprint, response_data, input_tokens_estimate, created_at=now)
             except Exception as retry_err:
                 logger.warning("In-memory cache write retry error: %s", retry_err)
         except Exception as err:
@@ -518,12 +542,15 @@ class DeterministicCache:
         fingerprint: str,
         data: Dict[str, Any],
         tokens_estimate: int,
+        created_at: Optional[float] = None,
     ) -> None:
         if fingerprint in self._memory_lru:
             existing = self._memory_lru.pop(fingerprint)
             hit_count = existing.get("hit_count", 0) + 1
+            entry_time = existing.get("created_at", created_at or time.time())
         else:
             hit_count = 0
+            entry_time = created_at or time.time()
 
         if len(self._memory_lru) >= self.max_memory_items:
             oldest_key = next(iter(self._memory_lru))
@@ -533,6 +560,7 @@ class DeterministicCache:
             "data": data,
             "hit_count": hit_count,
             "tokens_estimate": tokens_estimate,
+            "created_at": entry_time,
         }
 
     def clear(self) -> None:
@@ -602,7 +630,13 @@ class ResponseCalibrator:
 
         for name, ans in raw_answers.items():
             if not isinstance(ans, dict):
-                calibrated[name] = ans
+                calibrated[name] = {
+                    "is_ambiguous": True,
+                    "status": "AMBIGUOUS_STATE",
+                    "calibration": {"reasons": ["invalid_answer_structure"]},
+                    "raw": ans,
+                }
+                ambiguous_questions.append(name)
                 continue
 
             item = dict(ans)
@@ -614,6 +648,13 @@ class ResponseCalibrator:
                 self._calibrate_score(item)
             elif q_type == "noul":
                 self._calibrate_noul(item)
+            else:
+                item["is_ambiguous"] = True
+                item["status"] = "AMBIGUOUS_STATE"
+                item["calibration"] = {
+                    "reasons": ["unknown_question_type"],
+                    "question_type": q_type,
+                }
 
             if item.get("is_ambiguous", False):
                 ambiguous_questions.append(name)
@@ -702,14 +743,19 @@ class ResponseCalibrator:
 
     def _calibrate_score(self, item: Dict[str, Any]) -> None:
         reasons: List[str] = []
-        try:
-            conf = float(item.get("confidence", 1.0))
-            if math.isnan(conf) or math.isinf(conf):
+        raw_conf = item.get("confidence")
+        if raw_conf is None:
+            conf = 0.0
+            reasons.append("low_confidence")
+        else:
+            try:
+                conf = float(raw_conf)
+                if math.isnan(conf) or math.isinf(conf):
+                    conf = 0.0
+                    reasons.append("invalid_probability")
+            except (ValueError, TypeError):
                 conf = 0.0
                 reasons.append("invalid_probability")
-        except (ValueError, TypeError):
-            conf = 0.0
-            reasons.append("invalid_probability")
 
         probs = item.get("probabilities", {})
 
@@ -752,6 +798,13 @@ class ResponseCalibrator:
     def _calibrate_noul(self, item: Dict[str, Any]) -> None:
         val = item.get("noul")
         if val is None:
+            item["is_ambiguous"] = True
+            item["status"] = "AMBIGUOUS_STATE"
+            item["calibration"] = {
+                "boundary_distance": 0.0,
+                "probability": 0.0,
+                "reasons": ["missing_noul_value"],
+            }
             return
         try:
             prob = float(val)
@@ -930,11 +983,12 @@ class QuestionOptimizer:
 class ToolRegistry:
     """Registry maintaining tool schemas and operational handlers."""
 
-    def __init__(self, cache_db_path: Optional[str] = None):
+    def __init__(self, cache_db_path: Optional[str] = None, allow_test_mocks: bool = False):
         self._lock = threading.RLock()
         self.cache = DeterministicCache(db_path=cache_db_path)
         self.optimizer = QuestionOptimizer()
         self.calibrator = ResponseCalibrator()
+        self.allow_test_mocks = allow_test_mocks or (os.environ.get("JEVGUARD_TEST_MODE") == "1")
 
     def get_definitions(self) -> List[Dict[str, Any]]:
         with self._lock:
@@ -971,23 +1025,10 @@ class ToolRegistry:
                             "description": "Bypass deterministic cache lookup.",
                             "default": False,
                         },
-                        "api_key": {
-                            "type": "string",
-                            "description": "Optional TypeSafe AI API key (defaults to TYPESAFE_API_KEY environment variable).",
-                        },
-                        "endpoint": {
-                            "type": "string",
-                            "description": "Upstream API endpoint (default: https://api.typesafe.ai/v1/systemone).",
-                            "default": "https://api.typesafe.ai/v1/systemone",
-                        },
                         "timeout": {
                             "type": "number",
                             "description": "HTTP request timeout in seconds (default: 30.0).",
                             "default": 30.0,
-                        },
-                        "mock_answers": {
-                            "type": "object",
-                            "description": "Optional raw answers dictionary for testing or offline execution.",
                         },
                     },
                     "required": ["state", "questions"],
@@ -1107,19 +1148,6 @@ class ToolRegistry:
                             "description": "Whether execution uses sudo or administrative privileges (optional, default: false).",
                             "default": False,
                         },
-                        "mock_answers": {
-                            "type": "object",
-                            "description": "Optional raw answers dictionary for testing or offline evaluation.",
-                        },
-                        "api_key": {
-                            "type": "string",
-                            "description": "Optional TypeSafe AI API key (defaults to TYPESAFE_API_KEY environment variable).",
-                        },
-                        "endpoint": {
-                            "type": "string",
-                            "description": "Upstream API endpoint (default: https://api.typesafe.ai/v1/systemone).",
-                            "default": "https://api.typesafe.ai/v1/systemone",
-                        },
                         "timeout": {
                             "type": "number",
                             "description": "HTTP request timeout in seconds (default: 30.0).",
@@ -1157,19 +1185,6 @@ class ToolRegistry:
                             "description": "Risk tolerance threshold for acceptance (strict, balanced, permissive; default: balanced).",
                             "default": "balanced",
                         },
-                        "mock_answers": {
-                            "type": "object",
-                            "description": "Optional raw answers dictionary for testing or offline evaluation.",
-                        },
-                        "api_key": {
-                            "type": "string",
-                            "description": "Optional TypeSafe AI API key (defaults to TYPESAFE_API_KEY environment variable).",
-                        },
-                        "endpoint": {
-                            "type": "string",
-                            "description": "Upstream API endpoint (default: https://api.typesafe.ai/v1/systemone).",
-                            "default": "https://api.typesafe.ai/v1/systemone",
-                        },
                         "timeout": {
                             "type": "number",
                             "description": "HTTP request timeout in seconds (default: 30.0).",
@@ -1205,19 +1220,6 @@ class ToolRegistry:
                             "type": "array",
                             "items": {"type": "string"},
                             "description": "Candidate options list (e.g. ['A', 'B', 'C']).",
-                        },
-                        "mock_answers": {
-                            "type": "object",
-                            "description": "Optional raw answers dictionary for testing or offline evaluation.",
-                        },
-                        "api_key": {
-                            "type": "string",
-                            "description": "Optional TypeSafe AI API key (defaults to TYPESAFE_API_KEY environment variable).",
-                        },
-                        "endpoint": {
-                            "type": "string",
-                            "description": "Upstream API endpoint (default: https://api.typesafe.ai/v1/systemone).",
-                            "default": "https://api.typesafe.ai/v1/systemone",
                         },
                         "timeout": {
                             "type": "number",
@@ -1395,10 +1397,26 @@ class ToolRegistry:
             model = str(arguments.get("model", "jev-latest")).strip() or "jev-latest"
             auto_inject = bool(arguments.get("auto_inject_escapes", True))
             bypass_cache = bool(arguments.get("bypass_cache", False))
-            api_key = str(arguments.get("api_key") or os.environ.get("TYPESAFE_API_KEY", "")).strip()
-            endpoint = str(arguments.get("endpoint", "https://api.typesafe.ai/v1/systemone")).strip()
             timeout = float(arguments.get("timeout", 30.0))
-            mock_answers = arguments.get("mock_answers")
+
+            # Security: Never accept API key from client/LLM arguments
+            api_key = str(os.environ.get("TYPESAFE_API_KEY", "")).strip()
+
+            # Security: Endpoint is governed by server environment configuration
+            endpoint = str(os.environ.get("TYPESAFE_ENDPOINT") or os.environ.get("JEVGUARD_ENDPOINT") or "https://api.typesafe.ai/v1/systemone").strip()
+
+            # Security: mock_answers is forbidden in production to prevent verdict forgery
+            is_test = self.allow_test_mocks or (os.environ.get("JEVGUARD_TEST_MODE") == "1")
+            mock_answers = arguments.get("mock_answers") or arguments.get("_mock_answers")
+            if mock_answers is not None and not is_test:
+                return {
+                    "status": "error",
+                    "success": False,
+                    "error_type": "SecurityError",
+                    "message": "Direct mock_answers injection is forbidden in production MCP server.",
+                    "verdict": "MANUAL_REVIEW_REQUIRED",
+                    "fallback_action": "MANUAL_REVIEW_REQUIRED",
+                }
 
             t0 = time.perf_counter()
 
@@ -1916,6 +1934,23 @@ class ToolRegistry:
         max_retries: int = 3,
         initial_backoff: float = 0.5,
     ) -> Dict[str, Any]:
+        canonical_endpoint = str(endpoint).strip()
+        allowed = (
+            canonical_endpoint.startswith("https://api.typesafe.ai/")
+            or canonical_endpoint.startswith("https://typesafe.ai/")
+        )
+        custom_allowed = os.environ.get("JEVGUARD_ALLOWED_ENDPOINTS")
+        if custom_allowed:
+            for allowed_prefix in custom_allowed.split(","):
+                prefix = allowed_prefix.strip()
+                if prefix and canonical_endpoint.startswith(prefix):
+                    allowed = True
+                    break
+        if not allowed:
+            raise PermissionError(
+                f"Endpoint '{canonical_endpoint}' is not permitted. Only official TypeSafe AI endpoints or JEVGUARD_ALLOWED_ENDPOINTS are authorized."
+            )
+
         raw_bytes = json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {api_key}",

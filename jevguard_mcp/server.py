@@ -36,12 +36,13 @@ class MCPServer:
         name: str = SERVER_NAME,
         version: str = SERVER_VERSION,
         cache_db_path: Optional[str] = None,
+        allow_test_mocks: bool = False,
     ):
         self.name = name
         self.version = version
         self.protocol_version = PROTOCOL_VERSION
         self._lock = threading.RLock()
-        self.registry = ToolRegistry(cache_db_path=cache_db_path)
+        self.registry = ToolRegistry(cache_db_path=cache_db_path, allow_test_mocks=allow_test_mocks)
         self.initialized = False
         self.running = False
 
