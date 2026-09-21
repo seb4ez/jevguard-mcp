@@ -26,33 +26,80 @@ A live benchmark was conducted directly against the official TypeSafe AI endpoin
 
 ## Available Tools
 
-### 1. `jevguard_evaluate`
-Executes the deterministic JevGuard evaluation pipeline:
+### Atomic Tools for Coding Agents (Cursor, Antigravity, Claude Desktop)
+
+High-level tools with atomic arguments (`str`, `bool`, `list[str]`) designed specifically for AI code agents, preventing hallucinated question schemas:
+
+#### 1. `evaluate_command_safety`
+Evaluates whether a terminal/shell command is destructive, requires human approval, or can execute autonomously:
+- **Arguments**:
+  - `command: str` (required): Shell command to evaluate.
+  - `working_dir: str = ""` (optional): Target execution directory.
+  - `elevated_privileges: bool = false` (optional): Whether the command runs with `sudo` or administrator privileges.
+- **Pipeline**: Constructs a unified Noul (boundary destruction probability), Score (operational blast radius), and Choice (policy recommendation) evaluation with certainty calibration.
+- **Output**: Returns an execution policy: `ALLOW_AUTONOMOUS`, `REQUIRE_HUMAN_APPROVAL`, or `DENY_DESTRUCTIVE`.
+
+#### 2. `verify_code_patch`
+Verifies unified git diffs or code patches for regressions, broken syntax, or critical system impact:
+- **Arguments**:
+  - `patch_content: str` (required): Unified diff or patch text.
+  - `target_file: str` (required): Target file path.
+  - `risk_tolerance: str = "balanced"` (optional): Risk threshold (`"strict"`, `"balanced"`, `"permissive"`).
+- **Pipeline**: Calibrates regression probability and risk score against the configured risk tolerance threshold.
+- **Output**: Returns `approved` (boolean), `recommendation` (`"APPROVE"`, `"REQUEST_CHANGES"`, `"REJECT"`), and `risk_level` (`"LOW"`, `"MEDIUM"`, `"HIGH"`, `"CRITICAL"`).
+
+#### 3. `evaluate_decision`
+Allows coding agents to resolve architectural or technical decisions with a flat options list:
+- **Arguments**:
+  - `context: str` (required): Background context and requirements.
+  - `decision_question: str` (required): Core decision question.
+  - `options: list[str]` (required): Candidate options (e.g. `["PostgreSQL", "SQLite", "DuckDB"]`).
+- **Pipeline**: Automatically injects closed-world neutral escape (`UNRESOLVED_OR_OTHER`) to catch out-of-distribution choices and calibrates probability dispersion.
+- **Output**: Returns `selected_option`, `confidence`, `is_escape_selected`, and `status` (`CONFIDENT` or `AMBIGUOUS_STATE`).
+
+---
+
+### Core JevGuard Primitives
+
+#### 4. `jevguard_evaluate`
+Executes the full deterministic JevGuard evaluation pipeline:
 - Prunes incoming state data to eliminate empty keys and duplicate whitespace.
 - Normalizes question schemas and injects closed-world escape alternatives (`UNRESOLVED_OR_OTHER`) to prevent false positives.
 - Computes canonical SHA-256 fingerprints with volatile key masking.
 - Queries the zero-token cache on hit or dispatches upstream to TypeSafe AI when credentials are configured.
 - Calibrates response certainty and dispersion metrics.
 
-### 2. `jevguard_calibrate`
+#### 5. `jevguard_calibrate`
 Analyzes response probability distributions to prevent false certainty:
 - Flags low confidence when the top probability falls below 0.40 (`top_prob < 0.40`).
 - Flags flat distributions when the gap between top and runner-up choices is below 0.15 (`dispersion_gap < 0.15`).
 - Evaluates boundary uncertainty for continuous noul probability ranges near 0.50 (`|prob - 0.50| < 0.12`).
 - Returns structured verdicts: `AMBIGUOUS_STATE` or `CONFIDENT`.
 
-### 3. `jevguard_prune_state`
+#### 6. `jevguard_prune_state`
 Sanitizes structured input states:
 - Removes null values and empty strings/collections from mapping objects.
 - Normalizes and collapses repeated whitespace.
 - Detects circular references and replaces them with `<cyclic_ref>` tokens.
 - Calculates an input token count estimate.
 
-### 4. `jevguard_cache_fingerprint`
+#### 7. `jevguard_cache_fingerprint`
 Calculates a canonical SHA-256 fingerprint:
 - Recursively strips volatile fields (`timestamp`, `trace_id`, `request_id`, `created_at`, `updated_at`, `nonce`).
 - Orders dictionary keys deterministically.
 - Produces identical hashes for semantically identical states regardless of key ordering or volatile timestamp variance.
+
+## Robustness & Fault Tolerance
+
+1. **Hardened SQLite Concurrency**:
+   - Connections use `timeout=60.0` and `PRAGMA busy_timeout = 60000;` to prevent `database is locked` contention under parallel agent execution.
+   - Operates with `PRAGMA journal_mode=WAL;` and `PRAGMA synchronous=NORMAL;` for non-blocking concurrent reads and writes.
+   - Any unrecoverable lock, filesystem, or permission error transparently degrades to shared `:memory:` without crashing or aborting execution.
+
+2. **Structured Exception Handling & Protocol Stability**:
+   - All tool executions are wrapped in defensive error-handling handlers.
+   - Failures (HTTP errors, timeouts, network interruptions, validation errors) return actionable JSON text payloads with `"fallback_action": "MANUAL_REVIEW_REQUIRED"`.
+   - The MCP JSON-RPC connection remains active (`isError: false` on structured payloads) so client environments (Cursor, Claude Desktop, Antigravity) never disconnect unexpectedly.
 
 ## Installation
 

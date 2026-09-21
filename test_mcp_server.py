@@ -10,6 +10,7 @@ import json
 import math
 import os
 import pathlib
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -124,7 +125,7 @@ class TestToolsList(unittest.TestCase):
         response = self.server.handle_message(request)
         self.assertIsNotNone(response)
         tools = response.get("result", {}).get("tools", [])
-        self.assertEqual(len(tools), 4)
+        self.assertEqual(len(tools), 7)
 
         tool_names = {t["name"] for t in tools}
         expected_names = {
@@ -132,6 +133,9 @@ class TestToolsList(unittest.TestCase):
             "jevguard_calibrate",
             "jevguard_prune_state",
             "jevguard_cache_fingerprint",
+            "evaluate_command_safety",
+            "verify_code_patch",
+            "evaluate_decision",
         }
         self.assertEqual(tool_names, expected_names)
 
@@ -735,7 +739,7 @@ class TestAuditPoint2MissingEnvVariables(unittest.TestCase):
         resp_tools = self.server.handle_message({
             "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
         })
-        self.assertEqual(len(resp_tools["result"]["tools"]), 4)
+        self.assertEqual(len(resp_tools["result"]["tools"]), 7)
 
     def test_evaluate_without_api_key_returns_structured_error(self):
         state = {"order_id": "ord_100"}
@@ -949,6 +953,523 @@ class TestAuditPoint6PyprojectToml(unittest.TestCase):
         self.assertIn("dependencies = []", content)
         self.assertIn("[project.scripts]", content)
         self.assertIn('jevguard-mcp = "jevguard_mcp.server:main"', content)
+
+
+class TestAtomicToolsProtocol(unittest.TestCase):
+    """Verifies the 3 high-level atomic tools through the MCP JSON-RPC protocol."""
+
+    def setUp(self):
+        self.server = MCPServer(cache_db_path=":memory:")
+
+    def test_call_evaluate_command_safety_allow_autonomous(self):
+        mock_answers = {
+            "is_destructive": {
+                "type": "noul",
+                "noul": 0.05,
+                "confidence": 0.95,
+            },
+            "risk_score": {
+                "type": "score",
+                "confidence": 0.90,
+            },
+            "execution_policy": {
+                "type": "choice",
+                "choice": "ALLOW_AUTONOMOUS",
+                "confidence": 0.95,
+                "probabilities": {
+                    "ALLOW_AUTONOMOUS": 0.95,
+                    "REQUIRE_HUMAN_APPROVAL": 0.04,
+                    "DENY_DESTRUCTIVE": 0.01,
+                },
+            },
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 201,
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_command_safety",
+                "arguments": {
+                    "command": "pytest -v tests/",
+                    "working_dir": "/workspace",
+                    "elevated_privileges": False,
+                    "mock_answers": mock_answers,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        self.assertIsNotNone(resp)
+        self.assertFalse(resp.get("result", {}).get("isError", True))
+
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertTrue(content["success"])
+        self.assertEqual(content["policy"], "ALLOW_AUTONOMOUS")
+        self.assertEqual(content["command"], "pytest -v tests/")
+        self.assertFalse(content["verdict"]["requires_human"])
+        self.assertIn("telemetry", content)
+        self.assertIn("cache_fingerprint", content)
+
+    def test_call_evaluate_command_safety_deny_destructive(self):
+        mock_answers = {
+            "is_destructive": {
+                "type": "noul",
+                "noul": 0.98,
+                "confidence": 0.99,
+            },
+            "risk_score": {
+                "type": "score",
+                "confidence": 0.95,
+            },
+            "execution_policy": {
+                "type": "choice",
+                "choice": "DENY_DESTRUCTIVE",
+                "confidence": 0.99,
+                "probabilities": {
+                    "DENY_DESTRUCTIVE": 0.99,
+                    "REQUIRE_HUMAN_APPROVAL": 0.01,
+                    "ALLOW_AUTONOMOUS": 0.0,
+                },
+            },
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 202,
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_command_safety",
+                "arguments": {
+                    "command": "rm -rf / --no-preserve-root",
+                    "mock_answers": mock_answers,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        self.assertIsNotNone(resp)
+        self.assertFalse(resp.get("result", {}).get("isError", True))
+
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertTrue(content["success"])
+        self.assertEqual(content["policy"], "DENY_DESTRUCTIVE")
+        self.assertTrue(content["verdict"]["requires_human"])
+
+    def test_call_evaluate_command_safety_elevated_privileges_requires_approval(self):
+        mock_answers = {
+            "is_destructive": {
+                "type": "noul",
+                "noul": 0.10,
+                "confidence": 0.90,
+            },
+            "risk_score": {
+                "type": "score",
+                "confidence": 0.85,
+            },
+            "execution_policy": {
+                "type": "choice",
+                "choice": "ALLOW_AUTONOMOUS",
+                "confidence": 0.85,
+                "probabilities": {
+                    "ALLOW_AUTONOMOUS": 0.85,
+                    "REQUIRE_HUMAN_APPROVAL": 0.15,
+                },
+            },
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 203,
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_command_safety",
+                "arguments": {
+                    "command": "systemctl restart nginx",
+                    "elevated_privileges": True,
+                    "mock_answers": mock_answers,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertTrue(content["success"])
+        self.assertEqual(content["policy"], "REQUIRE_HUMAN_APPROVAL")
+        self.assertTrue(content["verdict"]["requires_human"])
+
+    def test_call_evaluate_command_safety_missing_command_returns_structured_error(self):
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 204,
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_command_safety",
+                "arguments": {},
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        self.assertIsNotNone(resp)
+        self.assertFalse(resp.get("result", {}).get("isError", True))
+
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertFalse(content["success"])
+        self.assertEqual(content["error_type"], "ValueError")
+        self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+
+    def test_call_verify_code_patch_approve(self):
+        patch = "--- a/utils.py\n+++ b/utils.py\n@@ -10,3 +10,3 @@\n-def add(a, b): return a - b\n+def add(a, b): return a + b\n"
+        mock_answers = {
+            "has_regression": {
+                "type": "noul",
+                "noul": 0.02,
+                "confidence": 0.98,
+            },
+            "risk_score": {
+                "type": "score",
+                "confidence": 0.95,
+            },
+            "recommendation": {
+                "type": "choice",
+                "choice": "APPROVE",
+                "confidence": 0.95,
+                "probabilities": {"APPROVE": 0.95, "REQUEST_CHANGES": 0.05},
+            },
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 205,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_code_patch",
+                "arguments": {
+                    "patch_content": patch,
+                    "target_file": "utils.py",
+                    "risk_tolerance": "balanced",
+                    "mock_answers": mock_answers,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        self.assertIsNotNone(resp)
+        self.assertFalse(resp.get("result", {}).get("isError", True))
+
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertTrue(content["success"])
+        self.assertTrue(content["approved"])
+        self.assertEqual(content["recommendation"], "APPROVE")
+        self.assertEqual(content["risk_level"], "LOW")
+        self.assertEqual(content["target_file"], "utils.py")
+
+    def test_call_verify_code_patch_reject(self):
+        patch = "--- a/db.py\n+++ b/db.py\n@@ -1 +1 @@\n-SELECT * FROM users;\n+DROP TABLE users;\n"
+        mock_answers = {
+            "has_regression": {
+                "type": "noul",
+                "noul": 0.95,
+                "confidence": 0.99,
+            },
+            "risk_score": {
+                "type": "score",
+                "confidence": 0.99,
+            },
+            "recommendation": {
+                "type": "choice",
+                "choice": "REJECT",
+                "confidence": 0.99,
+                "probabilities": {"REJECT": 0.99, "APPROVE": 0.01},
+            },
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 206,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_code_patch",
+                "arguments": {
+                    "patch_content": patch,
+                    "target_file": "db.py",
+                    "mock_answers": mock_answers,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertTrue(content["success"])
+        self.assertFalse(content["approved"])
+        self.assertEqual(content["recommendation"], "REJECT")
+        self.assertEqual(content["risk_level"], "CRITICAL")
+
+    def test_call_verify_code_patch_strict_request_changes(self):
+        patch = "--- a/auth.py\n+++ b/auth.py\n@@ -5 +5 @@\n-verify(token)\n+skip_verify(token)\n"
+        mock_answers = {
+            "has_regression": {
+                "type": "noul",
+                "noul": 0.25,
+                "confidence": 0.80,
+            },
+            "risk_score": {
+                "type": "score",
+                "confidence": 0.70,
+            },
+            "recommendation": {
+                "type": "choice",
+                "choice": "APPROVE",
+                "confidence": 0.60,
+                "probabilities": {"APPROVE": 0.60, "REQUEST_CHANGES": 0.40},
+            },
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 207,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_code_patch",
+                "arguments": {
+                    "patch_content": patch,
+                    "target_file": "auth.py",
+                    "risk_tolerance": "strict",
+                    "mock_answers": mock_answers,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertTrue(content["success"])
+        self.assertFalse(content["approved"])
+        self.assertEqual(content["recommendation"], "REQUEST_CHANGES")
+
+    def test_call_verify_code_patch_missing_args_returns_structured_error(self):
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 208,
+            "method": "tools/call",
+            "params": {
+                "name": "verify_code_patch",
+                "arguments": {"target_file": "file.py"},
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        self.assertFalse(resp.get("result", {}).get("isError", True))
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertFalse(content["success"])
+        self.assertEqual(content["error_type"], "ValueError")
+        self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+
+    def test_call_evaluate_decision_confident(self):
+        mock_answers = {
+            "decision": {
+                "type": "choice",
+                "choice": "PostgreSQL",
+                "confidence": 0.94,
+                "probabilities": {
+                    "PostgreSQL": 0.94,
+                    "SQLite": 0.04,
+                    "DuckDB": 0.02,
+                },
+            }
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 209,
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_decision",
+                "arguments": {
+                    "context": "OLTP database handling multi-tenant e-commerce transactions",
+                    "decision_question": "Which database engine should be used?",
+                    "options": ["PostgreSQL", "SQLite", "DuckDB"],
+                    "mock_answers": mock_answers,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        self.assertFalse(resp.get("result", {}).get("isError", True))
+
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertTrue(content["success"])
+        self.assertEqual(content["selected_option"], "PostgreSQL")
+        self.assertEqual(content["confidence"], 0.94)
+        self.assertEqual(content["status"], "CONFIDENT")
+        self.assertFalse(content["is_escape_selected"])
+        self.assertIn("options", content)
+
+    def test_call_evaluate_decision_auto_injected_escape_selected(self):
+        mock_answers = {
+            "decision": {
+                "type": "choice",
+                "choice": ESCAPE_OPTION_KEY,
+                "confidence": 0.98,
+                "probabilities": {
+                    ESCAPE_OPTION_KEY: 0.98,
+                    "MySQL": 0.01,
+                    "Redis": 0.01,
+                },
+            }
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 210,
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_decision",
+                "arguments": {
+                    "context": "We need an in-memory vector database with GPU acceleration",
+                    "decision_question": "Choose the best candidate",
+                    "options": ["MySQL", "Redis"],
+                    "mock_answers": mock_answers,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertTrue(content["success"])
+        self.assertEqual(content["selected_option"], ESCAPE_OPTION_KEY)
+        self.assertTrue(content["is_escape_selected"])
+
+    def test_call_evaluate_decision_empty_options_returns_structured_error(self):
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 211,
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_decision",
+                "arguments": {
+                    "context": "Some context",
+                    "decision_question": "Some question",
+                    "options": [],
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        self.assertFalse(resp.get("result", {}).get("isError", True))
+        content = json.loads(resp["result"]["content"][0]["text"])
+        self.assertFalse(content["success"])
+        self.assertEqual(content["error_type"], "ValueError")
+        self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+
+
+class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
+    """Verifies that failures never disconnect the MCP JSON-RPC protocol."""
+
+    def setUp(self):
+        self.server = MCPServer(cache_db_path=":memory:")
+
+    def test_simulated_tool_exception_returns_structured_json(self):
+        with mock.patch.object(self.server.registry, "_tool_evaluate", side_effect=RuntimeError("Simulated upstream gateway timeout")):
+            call_msg = {
+                "jsonrpc": "2.0",
+                "id": 301,
+                "method": "tools/call",
+                "params": {
+                    "name": "evaluate_command_safety",
+                    "arguments": {"command": "git pull"},
+                },
+            }
+            resp = self.server.handle_message(call_msg)
+            self.assertIsNotNone(resp)
+            self.assertFalse(resp.get("result", {}).get("isError", True))
+
+            content = json.loads(resp["result"]["content"][0]["text"])
+            self.assertFalse(content["success"])
+            self.assertEqual(content["error_type"], "RuntimeError")
+            self.assertEqual(content["message"], "Simulated upstream gateway timeout")
+            self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+
+    def test_all_atomic_tools_without_api_key_return_structured_error(self):
+        tools_to_test = [
+            ("evaluate_command_safety", {"command": "npm run test"}),
+            ("verify_code_patch", {"patch_content": "+line", "target_file": "a.txt"}),
+            ("evaluate_decision", {"context": "ctx", "decision_question": "q", "options": ["A", "B"]}),
+        ]
+
+        for tool_name, args in tools_to_test:
+            with self.subTest(tool=tool_name):
+                call_msg = {
+                    "jsonrpc": "2.0",
+                    "id": 302,
+                    "method": "tools/call",
+                    "params": {"name": tool_name, "arguments": args},
+                }
+                resp = self.server.handle_message(call_msg)
+                self.assertIsNotNone(resp)
+                self.assertFalse(resp.get("result", {}).get("isError", True))
+                content = json.loads(resp["result"]["content"][0]["text"])
+                self.assertFalse(content["success"])
+                self.assertEqual(content["error_type"], "ConfigurationError")
+                self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+
+
+class TestHardenedSQLiteConcurrency(unittest.TestCase):
+    """Verifies SQLite WAL mode, timeout, and transparent degradation to :memory:."""
+
+    def test_sqlite_pragmas_configured_on_file_db(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(pathlib.Path(tmpdir) / "test_concurrency.db")
+            cache = DeterministicCache(db_path=db_path)
+
+            with cache._get_connection() as conn:
+                journal_mode = conn.execute("PRAGMA journal_mode;").fetchone()[0]
+                self.assertEqual(str(journal_mode).lower(), "wal")
+
+                sync = conn.execute("PRAGMA synchronous;").fetchone()[0]
+                self.assertEqual(int(sync), 1)
+
+                busy_timeout = conn.execute("PRAGMA busy_timeout;").fetchone()[0]
+                self.assertEqual(int(busy_timeout), 60000)
+
+            cache.close()
+
+    def test_sqlite_operational_error_degrades_transparently_to_memory(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = str(pathlib.Path(tmpdir) / "locked_test.db")
+            cache = DeterministicCache(db_path=db_path)
+
+            cache.put("fp_alpha", "jev-latest", {"result": "ok"})
+            self.assertEqual(cache.get("fp_alpha"), {"result": "ok"})
+
+            # Close real connection before assigning mock to avoid WinError 32 on temp directory removal
+            if getattr(cache._local, "conn", None) is not None:
+                cache._local.conn.close()
+
+            mock_conn = mock.MagicMock()
+            mock_conn.execute.side_effect = sqlite3.OperationalError("database is locked")
+            cache._local.conn = mock_conn
+
+            val = cache.get("fp_nonexistent")
+            self.assertIsNone(val)
+            self.assertEqual(cache.db_path, ":memory:")
+
+            cache.put("fp_beta", "jev-latest", {"status": "recovered"})
+            self.assertEqual(cache.get("fp_beta"), {"status": "recovered"})
+
+            cache.close()
+
+    def test_sqlite_init_db_error_degrades_to_memory(self):
+        real_connect = sqlite3.connect
+
+        def mock_connect(*args, **kwargs):
+            if args and "locked_init_path.db" in str(args[0]):
+                raise sqlite3.OperationalError("disk I/O error")
+            return real_connect(*args, **kwargs)
+
+        with mock.patch("sqlite3.connect", side_effect=mock_connect):
+            cache = DeterministicCache(db_path="locked_init_path.db")
+            self.assertEqual(cache.db_path, ":memory:")
+            cache.close()
 
 
 if __name__ == "__main__":

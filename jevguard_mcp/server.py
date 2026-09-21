@@ -243,6 +243,12 @@ class MCPServer:
                 },
             }
         except Exception as err:
+            err_dict = {
+                "success": False,
+                "error_type": type(err).__name__,
+                "message": str(err),
+                "fallback_action": "MANUAL_REVIEW_REQUIRED",
+            }
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -250,10 +256,10 @@ class MCPServer:
                     "content": [
                         {
                             "type": "text",
-                            "text": f"Error executing tool '{name}': {err}",
+                            "text": json.dumps(err_dict, indent=2, sort_keys=True, default=str),
                         }
                     ],
-                    "isError": True,
+                    "isError": False,
                 },
             }
 
