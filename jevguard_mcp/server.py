@@ -312,7 +312,7 @@ class MCPServer:
                 except (BrokenPipeError, ConnectionResetError):
                     break
                 except Exception as err:
-                    logger.debug("Input stream read error: %s", err)
+                    logger.error("Input stream read error: %s", err, exc_info=True)
                     break
 
                 if not line:
@@ -337,13 +337,13 @@ class MCPServer:
                     except (BrokenPipeError, ConnectionResetError):
                         break
                     except Exception as err:
-                        logger.debug("Output stream write error: %s", err)
+                        logger.error("Output stream write error: %s", err, exc_info=True)
                         break
 
         except KeyboardInterrupt:
             pass
         except Exception as err:
-            logger.debug("Event loop unexpected exception: %s", err)
+            logger.error("Event loop unexpected exception: %s", err, exc_info=True)
         finally:
             with self._lock:
                 self.running = False

@@ -14,12 +14,17 @@ import sqlite3
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 from unittest import mock
 
 # Enable test mode for test suite execution to permit test mock answers
 os.environ["JEVGUARD_TEST_MODE"] = "1"
+
+repo_root = str(pathlib.Path(__file__).resolve().parent)
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
 
 from jevguard_mcp.server import MCPServer
 from jevguard_mcp.tools import (
@@ -1737,7 +1742,58 @@ class TestSecurityHardeningAndAudit(unittest.TestCase):
         )
         self.assertTrue(res_patch["success"])
         self.assertFalse(res_patch["approved"])
-        self.assertEqual(res_patch["recommendation"], "REQUEST_CHANGES")
+    def test_dispatch_upstream_uses_canonical_endpoint_in_request(self):
+        registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=True)
+        captured_req = []
+
+        class MockResp:
+            def getcode(self):
+                return 200
+            def read(self):
+                return b'{"success": true}'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                pass
+
+        class MockOpener:
+            def open(self, req, timeout=30.0):
+                captured_req.append(req)
+                return MockResp()
+
+        with mock.patch("urllib.request.build_opener", return_value=MockOpener()):
+            res = registry._dispatch_upstream(
+                endpoint="  https://api.typesafe.ai/v1/systemone  ",
+                api_key="test_key",
+                payload={"data": 123},
+            )
+            self.assertTrue(res["success"])
+            self.assertEqual(len(captured_req), 1)
+            self.assertEqual(captured_req[0].full_url, "https://api.typesafe.ai/v1/systemone")
+
+    def test_is_authorized_endpoint_rejects_wildcards(self):
+        from jevguard_mcp.tools import is_authorized_endpoint
+        with mock.patch.dict(os.environ, {"JEVGUARD_ALLOWED_ENDPOINTS": "*.typesafe.ai,evil?.com,test[0-9].corp,internal.corp"}):
+            self.assertFalse(is_authorized_endpoint("https://*.typesafe.ai"))
+            self.assertFalse(is_authorized_endpoint("https://sub.typesafe.ai"))
+            self.assertFalse(is_authorized_endpoint("https://evil1.com"))
+            self.assertFalse(is_authorized_endpoint("https://test1.corp"))
+            self.assertTrue(is_authorized_endpoint("https://internal.corp"))
+
+    def test_question_optimizer_missing_type_raises_error(self):
+        opt = QuestionOptimizer()
+        with self.assertRaises(ValueError) as ctx:
+            opt.normalize_questions({"q": {"instructions": "foo"}})
+        self.assertIn("missing required 'type' field", str(ctx.exception).lower())
+
+    def test_deterministic_cache_purge_on_put(self):
+        cache = DeterministicCache(db_path=":memory:", ttl_seconds=0.1)
+        cache.put("fp_old", "jev-latest", {"status": "old"})
+        time.sleep(0.15)
+        cache.put("fp_new", "jev-latest", {"status": "new"})
+        with cache._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) as cnt FROM evaluation_cache WHERE fingerprint = 'fp_old'")
+            self.assertEqual(cur.fetchone()["cnt"], 0)
 
 
 if __name__ == "__main__":

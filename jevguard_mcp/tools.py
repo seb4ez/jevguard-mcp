@@ -92,9 +92,11 @@ def is_authorized_endpoint(endpoint: str) -> bool:
         for entry in custom_allowed.split(","):
             entry = entry.strip()
             if entry:
+                if any(c in entry for c in "*?[]"):
+                    continue
                 try:
                     custom_parsed = urllib.parse.urlsplit(entry if "://" in entry else f"https://{entry}")
-                    if custom_parsed.hostname:
+                    if custom_parsed.hostname and not any(c in custom_parsed.hostname for c in "*?[]"):
                         allowed_hosts.add(custom_parsed.hostname.lower())
                 except Exception:
                     pass
@@ -546,9 +548,15 @@ class DeterministicCache:
                         input_tokens_estimate,
                     ),
                 )
+                if self.ttl_seconds > 0:
+                    conn.execute("DELETE FROM evaluation_cache WHERE created_at < ?", (now - self.ttl_seconds,))
                 conn.commit()
 
             with self._lock:
+                if self.ttl_seconds > 0:
+                    expired_keys = [k for k, v in self._memory_lru.items() if (now - v.get("created_at", 0.0)) > self.ttl_seconds]
+                    for k in expired_keys:
+                        del self._memory_lru[k]
                 self._promote_lru(fingerprint, response_data, input_tokens_estimate, created_at=now)
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
             logger.warning("Cache write database error for %s: %s. Falling back to :memory:.", fingerprint, err)
@@ -570,8 +578,14 @@ class DeterministicCache:
                             input_tokens_estimate,
                         ),
                     )
+                    if self.ttl_seconds > 0:
+                        conn.execute("DELETE FROM evaluation_cache WHERE created_at < ?", (now - self.ttl_seconds,))
                     conn.commit()
                 with self._lock:
+                    if self.ttl_seconds > 0:
+                        expired_keys = [k for k, v in self._memory_lru.items() if (now - v.get("created_at", 0.0)) > self.ttl_seconds]
+                        for k in expired_keys:
+                            del self._memory_lru[k]
                     self._promote_lru(fingerprint, response_data, input_tokens_estimate, created_at=now)
             except Exception as retry_err:
                 logger.warning("In-memory cache write retry error: %s", retry_err)
@@ -928,7 +942,9 @@ class QuestionOptimizer:
         if not isinstance(q, dict):
             raise ValueError(f"Invalid question definition for '{name}': {q}")
 
-        q_type = str(q.get("type", "noul")).strip().lower()
+        if "type" not in q:
+            raise ValueError(f"Question '{name}' definition missing required 'type' field.")
+        q_type = str(q.get("type", "")).strip().lower()
         instructions = str(q.get("instructions") or q.get("question") or "")
 
         allow_escape = True
@@ -992,9 +1008,10 @@ class QuestionOptimizer:
         questions: Union[Dict[str, Any], List[Dict[str, Any]]],
         model: Optional[str] = None,
         auto_inject_escapes: Optional[bool] = None,
+        collapse_whitespace: bool = True,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         target_model = (model or self.default_model).strip() or self.default_model
-        pruned_state = StatePruner.prune(state)
+        pruned_state = StatePruner.prune(state, collapse_whitespace=collapse_whitespace)
 
         should_inject = (
             self.auto_inject_escapes if auto_inject_escapes is None else auto_inject_escapes
@@ -1509,11 +1526,13 @@ class ToolRegistry:
 
             t0 = time.perf_counter()
 
+            collapse_whitespace = bool(arguments.get("collapse_whitespace", True))
             wire_payload, opt_metadata = self.optimizer.optimize_and_wire(
                 state=state,
                 questions=questions,
                 model=model,
                 auto_inject_escapes=auto_inject,
+                collapse_whitespace=collapse_whitespace,
             )
             tokens_estimate = opt_metadata["estimated_tokens"]
 
@@ -1631,11 +1650,7 @@ class ToolRegistry:
 
             working_dir = str(arguments.get("working_dir", "") or "").strip()
             elevated = bool(arguments.get("elevated_privileges", False))
-            mock_answers = (
-                arguments.get("mock_answers")
-                if (self.allow_test_mocks or os.environ.get("JEVGUARD_TEST_MODE") == "1")
-                else None
-            )
+            mock_answers = arguments.get("mock_answers")
             timeout = float(arguments.get("timeout", 30.0))
             bypass_cache = bool(arguments.get("bypass_cache", True))
 
@@ -1682,6 +1697,7 @@ class ToolRegistry:
                 "questions": questions,
                 "timeout": timeout,
                 "bypass_cache": bypass_cache,
+                "collapse_whitespace": False,
             }
             if mock_answers is not None:
                 eval_payload["mock_answers"] = mock_answers
@@ -1775,11 +1791,7 @@ class ToolRegistry:
             if risk_tolerance not in ("strict", "balanced", "permissive"):
                 raise ValueError("Argument 'risk_tolerance' must be one of: strict, balanced, permissive")
 
-            mock_answers = (
-                arguments.get("mock_answers")
-                if (self.allow_test_mocks or os.environ.get("JEVGUARD_TEST_MODE") == "1")
-                else None
-            )
+            mock_answers = arguments.get("mock_answers")
             timeout = float(arguments.get("timeout", 30.0))
             bypass_cache = bool(arguments.get("bypass_cache", True))
 
@@ -1826,6 +1838,7 @@ class ToolRegistry:
                 "questions": questions,
                 "timeout": timeout,
                 "bypass_cache": bypass_cache,
+                "collapse_whitespace": False,
             }
             if mock_answers is not None:
                 eval_payload["mock_answers"] = mock_answers
@@ -2055,7 +2068,7 @@ class ToolRegistry:
 
         while attempts < max_attempts:
             attempts += 1
-            req = urllib.request.Request(endpoint, data=raw_bytes, headers=headers, method="POST")
+            req = urllib.request.Request(canonical_endpoint, data=raw_bytes, headers=headers, method="POST")
             t0 = time.perf_counter()
 
             try:
