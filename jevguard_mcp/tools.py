@@ -250,6 +250,10 @@ class DeterministicCache:
                     return sorted(items)
                 except TypeError:
                     return sorted(items, key=lambda x: str(x))
+            elif isinstance(data, float):
+                if math.isnan(data) or math.isinf(data):
+                    return None
+                return data
             return data
         finally:
             if obj_id is not None:
@@ -304,7 +308,8 @@ class DeterministicCache:
                 self.stats["hits"] += 1
                 item = self._memory_lru[fingerprint]
                 self.stats["tokens_saved"] += item.get("tokens_estimate", 0)
-                item["hit_count"] = item.get("hit_count", 0) + 1
+                tokens = item.get("tokens_estimate", 0)
+                self._promote_lru(fingerprint, item["data"], tokens)
                 return item["data"]
 
         try:
@@ -367,12 +372,19 @@ class DeterministicCache:
         data: Dict[str, Any],
         tokens_estimate: int,
     ) -> None:
+        if fingerprint in self._memory_lru:
+            existing = self._memory_lru.pop(fingerprint)
+            hit_count = existing.get("hit_count", 0) + 1
+        else:
+            hit_count = 0
+
         if len(self._memory_lru) >= self.max_memory_items:
             oldest_key = next(iter(self._memory_lru))
             del self._memory_lru[oldest_key]
+
         self._memory_lru[fingerprint] = {
             "data": data,
-            "hit_count": 0,
+            "hit_count": hit_count,
             "tokens_estimate": tokens_estimate,
         }
 
@@ -471,28 +483,45 @@ class ResponseCalibrator:
     def _calibrate_choice(self, item: Dict[str, Any]) -> None:
         probs = item.get("probabilities", {})
         parsed_pairs: List[Tuple[str, float]] = []
+        has_invalid = False
         if isinstance(probs, dict):
             for k, v in probs.items():
                 try:
-                    parsed_pairs.append((str(k), float(v)))
+                    val = float(v)
+                    if math.isnan(val) or math.isinf(val):
+                        has_invalid = True
+                    else:
+                        parsed_pairs.append((str(k), val))
                 except (ValueError, TypeError):
-                    pass
+                    has_invalid = True
 
         if not parsed_pairs:
             try:
-                conf = float(item.get("confidence", 0.0))
+                raw_conf = item.get("confidence", 0.0)
+                conf = float(raw_conf)
+                if math.isnan(conf) or math.isinf(conf):
+                    conf = 0.0
+                    has_invalid = True
             except (ValueError, TypeError):
                 conf = 0.0
-            is_amb = conf < self.min_top_prob
+                has_invalid = True
+
+            reasons = []
+            if has_invalid:
+                reasons.append("invalid_probability")
+            if conf < self.min_top_prob:
+                reasons.append("low_confidence")
+
+            is_amb = len(reasons) > 0
             item["is_ambiguous"] = is_amb
             item["status"] = "AMBIGUOUS_STATE" if is_amb else "CONFIDENT"
             item["calibration"] = {
-                "dispersion_gap": conf,
-                "reasons": ["low_confidence"] if is_amb else [],
+                "dispersion_gap": round(conf, 4),
+                "reasons": reasons,
                 "runner_up_choice": None,
                 "runner_up_probability": 0.0,
                 "top_choice": item.get("choice"),
-                "top_probability": conf,
+                "top_probability": round(conf, 4),
             }
             return
 
@@ -502,6 +531,8 @@ class ResponseCalibrator:
         gap = top_p - runner_p
 
         reasons: List[str] = []
+        if has_invalid:
+            reasons.append("invalid_probability")
         if top_p < self.min_top_prob:
             reasons.append("low_confidence")
         if len(sorted_pairs) > 1 and gap < self.min_dispersion_gap:
@@ -520,15 +551,19 @@ class ResponseCalibrator:
         }
 
     def _calibrate_score(self, item: Dict[str, Any]) -> None:
+        reasons: List[str] = []
         try:
             conf = float(item.get("confidence", 1.0))
+            if math.isnan(conf) or math.isinf(conf):
+                conf = 0.0
+                reasons.append("invalid_probability")
         except (ValueError, TypeError):
             conf = 0.0
+            reasons.append("invalid_probability")
 
         probs = item.get("probabilities", {})
-        reasons: List[str] = []
 
-        if conf < self.min_top_prob:
+        if conf < self.min_top_prob and "low_confidence" not in reasons:
             reasons.append("low_confidence")
 
         dispersion_gap = conf
@@ -536,9 +571,15 @@ class ResponseCalibrator:
             parsed_probs: List[float] = []
             for v in probs.values():
                 try:
-                    parsed_probs.append(float(v))
+                    val = float(v)
+                    if math.isnan(val) or math.isinf(val):
+                        if "invalid_probability" not in reasons:
+                            reasons.append("invalid_probability")
+                    else:
+                        parsed_probs.append(val)
                 except (ValueError, TypeError):
-                    pass
+                    if "invalid_probability" not in reasons:
+                        reasons.append("invalid_probability")
             if len(parsed_probs) >= 2:
                 sorted_probs = sorted(parsed_probs, reverse=True)
                 top_p = sorted_probs[0]
@@ -546,7 +587,7 @@ class ResponseCalibrator:
                 dispersion_gap = top_p - runner_p
                 if top_p < self.min_top_prob and "low_confidence" not in reasons:
                     reasons.append("low_confidence")
-                if dispersion_gap < self.min_dispersion_gap:
+                if dispersion_gap < self.min_dispersion_gap and "flat_distribution" not in reasons:
                     reasons.append("flat_distribution")
 
         is_amb = len(reasons) > 0
@@ -565,6 +606,23 @@ class ResponseCalibrator:
         try:
             prob = float(val)
         except (ValueError, TypeError):
+            item["is_ambiguous"] = True
+            item["status"] = "AMBIGUOUS_STATE"
+            item["calibration"] = {
+                "boundary_distance": 0.0,
+                "probability": 0.0,
+                "reasons": ["invalid_probability"],
+            }
+            return
+
+        if math.isnan(prob) or math.isinf(prob):
+            item["is_ambiguous"] = True
+            item["status"] = "AMBIGUOUS_STATE"
+            item["calibration"] = {
+                "boundary_distance": 0.0,
+                "probability": 0.0,
+                "reasons": ["invalid_probability"],
+            }
             return
 
         dist = abs(prob - 0.50)
@@ -641,8 +699,10 @@ class QuestionOptimizer:
                 wire_dict["criteria"] = q["criteria"]
 
         elif q_type == "score":
-            criteria = q.get("criteria", [])
-            if not isinstance(criteria, list):
+            criteria = q.get("criteria")
+            if criteria is None:
+                criteria = []
+            elif not isinstance(criteria, list):
                 criteria = [criteria]
             wire_dict = {
                 "type": "score",
@@ -658,7 +718,10 @@ class QuestionOptimizer:
                 raw_crit = {}
             criteria = {str(k): str(v) for k, v in raw_crit.items()}
             closed = bool(q.get("closed_world", False))
-            allow_escape = q.get("auto_inject_escape", not closed)
+            allow_esc_opt = q.get("auto_inject_escape")
+            if allow_esc_opt is None:
+                allow_esc_opt = q.get("auto_inject_escapes")
+            allow_escape = bool(allow_esc_opt) if allow_esc_opt is not None else (not closed)
             wire_dict = {
                 "type": "choice",
                 "instructions": instructions,
@@ -851,6 +914,11 @@ class ToolRegistry:
                             "description": "Target model identifier (default: jev-latest).",
                             "default": "jev-latest",
                         },
+                        "auto_inject_escapes": {
+                            "type": "boolean",
+                            "description": "Whether to consider escape injection logic when computing fingerprint (default: true).",
+                            "default": True,
+                        },
                         "ignore_keys": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -896,12 +964,13 @@ class ToolRegistry:
         state = arguments["state"]
         questions = arguments.get("questions") or {}
         model = str(arguments.get("model", "jev-latest")).strip() or "jev-latest"
+        auto_inject = bool(arguments.get("auto_inject_escapes", True))
         ignore_keys = arguments.get("ignore_keys")
 
         wire_questions = questions
         if isinstance(questions, (dict, list)) and questions:
             try:
-                wire_questions, _ = self.optimizer.normalize_questions(questions, auto_inject_escapes=False)
+                wire_questions, _ = self.optimizer.normalize_questions(questions, auto_inject_escapes=auto_inject)
             except Exception:
                 wire_questions = questions
 
@@ -1104,15 +1173,17 @@ class ToolRegistry:
 
             except urllib.error.HTTPError as err:
                 code = err.code
-                if code in (400, 401, 403, 404):
+                try:
                     err_body = err.read().decode("utf-8", errors="replace")
+                except Exception:
+                    err_body = str(err)
+                if code in (400, 401, 403, 404):
                     raise RuntimeError(f"HTTP {code} error from TypeSafe AI: {err_body}")
 
                 if attempts < max_attempts:
                     delay = initial_backoff * (2 ** (attempts - 1)) + random.uniform(0.05, 0.25)
                     time.sleep(delay)
                     continue
-                err_body = err.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"HTTP {code} failure after retries: {err_body}")
 
             except (socket.timeout, TimeoutError) as err:

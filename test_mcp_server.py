@@ -494,5 +494,161 @@ class TestServerStdioPipeline(unittest.TestCase):
             self.assertIn("id", parsed)
 
 
+
+
+class TestDeterministicCacheLRU(unittest.TestCase):
+    """Verifies LRU memory eviction ordering and hit promotion."""
+
+    def test_lru_capacity_eviction_and_hit_promotion(self):
+        cache = DeterministicCache(db_path=":memory:", max_memory_items=2)
+        cache.put("fp_1", "jev-latest", {"data": 1})
+        cache.put("fp_2", "jev-latest", {"data": 2})
+
+        # Access fp_1 to promote it to MRU position
+        res1 = cache.get("fp_1")
+        self.assertEqual(res1, {"data": 1})
+
+        # Inserting fp_3 should evict fp_2 (since fp_1 was promoted)
+        cache.put("fp_3", "jev-latest", {"data": 3})
+
+        self.assertIn("fp_1", cache._memory_lru)
+        self.assertIn("fp_3", cache._memory_lru)
+        self.assertNotIn("fp_2", cache._memory_lru)
+        cache.close()
+
+    def test_volatile_key_masking_handles_nan_and_inf(self):
+        state = {
+            "valid": 100,
+            "nan_val": float("nan"),
+            "inf_val": float("inf"),
+            "timestamp": 123456,
+        }
+        stripped = DeterministicCache._strip_volatile_keys(state, set(["timestamp"]))
+        self.assertEqual(stripped["valid"], 100)
+        self.assertIsNone(stripped["nan_val"])
+        self.assertIsNone(stripped["inf_val"])
+        self.assertNotIn("timestamp", stripped)
+
+
+class TestFingerprintParity(unittest.TestCase):
+    """Verifies fingerprint parity between jevguard_cache_fingerprint and jevguard_evaluate."""
+
+    def setUp(self):
+        self.registry = ToolRegistry()
+
+    def test_cache_fingerprint_matches_evaluate_fingerprint(self):
+        state = {"user_id": "usr_42", "timestamp": 1726700000}
+        questions = {
+            "intent": {
+                "type": "choice",
+                "instructions": "Identify intent",
+                "criteria": {"billing": "Billing inquiry", "support": "Tech support"},
+            }
+        }
+
+        fp_res = self.registry.execute_tool(
+            "jevguard_cache_fingerprint",
+            {
+                "state": state,
+                "questions": questions,
+                "model": "jev-latest",
+                "auto_inject_escapes": True,
+            },
+        )
+
+        eval_res = self.registry.execute_tool(
+            "jevguard_evaluate",
+            {
+                "state": state,
+                "questions": questions,
+                "model": "jev-latest",
+                "auto_inject_escapes": True,
+                "mock_answers": {
+                    "intent": {
+                        "type": "choice",
+                        "choice": "billing",
+                        "confidence": 0.95,
+                        "probabilities": {"billing": 0.95, "support": 0.05},
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(fp_res["fingerprint"], eval_res["cache_fingerprint"])
+
+
+class TestCalibratorEdgeCases(unittest.TestCase):
+    """Verifies robust calibration against NaN and Inf probability payloads."""
+
+    def setUp(self):
+        self.calibrator = ResponseCalibrator()
+
+    def test_choice_with_nan_probability_flagged(self):
+        answers = {
+            "q1": {
+                "type": "choice",
+                "choice": "opt_a",
+                "confidence": 0.90,
+                "probabilities": {"opt_a": float("nan"), "opt_b": 0.10},
+            }
+        }
+        calibrated, summary = self.calibrator.calibrate(answers)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertIn("invalid_probability", calibrated["q1"]["calibration"]["reasons"])
+
+    def test_score_with_nan_confidence_flagged(self):
+        answers = {
+            "q1": {
+                "type": "score",
+                "score": 3,
+                "confidence": float("nan"),
+                "probabilities": {"1": 0.1, "3": 0.9},
+            }
+        }
+        calibrated, summary = self.calibrator.calibrate(answers)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertIn("invalid_probability", calibrated["q1"]["calibration"]["reasons"])
+
+    def test_noul_with_nan_or_inf_flagged(self):
+        answers = {
+            "q_nan": {"type": "noul", "noul": float("nan")},
+            "q_inf": {"type": "noul", "noul": float("inf")},
+        }
+        calibrated, summary = self.calibrator.calibrate(answers)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertIn("invalid_probability", calibrated["q_nan"]["calibration"]["reasons"])
+        self.assertIn("invalid_probability", calibrated["q_inf"]["calibration"]["reasons"])
+
+
+class TestQuestionOptimizerEdgeCases(unittest.TestCase):
+    """Verifies robustness of QuestionOptimizer against edge-case definitions."""
+
+    def setUp(self):
+        self.optimizer = QuestionOptimizer()
+
+    def test_score_question_with_none_criteria(self):
+        questions = {
+            "q_score": {
+                "type": "score",
+                "instructions": "Rate quality",
+                "criteria": None,
+            }
+        }
+        wire_questions, _ = self.optimizer.normalize_questions(questions)
+        self.assertEqual(wire_questions["q_score"]["criteria"], [])
+
+    def test_auto_inject_escape_override(self):
+        questions = {
+            "q_choice": {
+                "type": "choice",
+                "instructions": "Select option",
+                "criteria": {"a": "Alpha", "b": "Beta"},
+                "auto_inject_escape": False,
+            }
+        }
+        wire_questions, injected = self.optimizer.normalize_questions(questions, auto_inject_escapes=True)
+        self.assertNotIn("q_choice", injected)
+        self.assertNotIn(ESCAPE_OPTION_KEY, wire_questions["q_choice"]["criteria"])
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
