@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+from pathlib import Path
 import random
 import socket
 import sqlite3
@@ -142,8 +143,49 @@ class StatePruner:
     def estimate_tokens(cls, data: Any) -> int:
         if isinstance(data, str):
             return max(1, len(data) // 4)
-        raw = json.dumps(data, separators=(",", ":"))
+        raw = json.dumps(data, separators=(",", ":"), default=str)
         return max(1, len(raw) // 4)
+
+
+def get_default_cache_db_path(custom_path: Optional[str] = None) -> str:
+    """
+    Returns the canonical SQLite cache database path adhering to L2 caching requirements:
+    - Never uses relative paths that pollute the user's active workspace.
+    - Defaults to Path.home() / '.cache' / 'jevguard' / 'decision_cache.db'.
+    - Honors JEVGUARD_CACHE_PATH environment variable if custom_path is None.
+    - If ':memory:', returns ':memory:'.
+    - If a relative path is passed (or set via env), resolves it inside ~/.cache/jevguard.
+    - Gracefully falls back to ':memory:' upon any filesystem or permission error.
+    """
+    raw_path = custom_path
+    if raw_path is None:
+        raw_path = os.environ.get("JEVGUARD_CACHE_PATH")
+
+    if raw_path is not None:
+        raw_path = str(raw_path).strip()
+        if raw_path == ":memory:":
+            return ":memory:"
+
+    try:
+        base_dir = Path.home() / ".cache" / "jevguard"
+        if raw_path:
+            p = Path(raw_path)
+            if p.is_absolute():
+                target_path = p
+            else:
+                target_path = base_dir / p
+        else:
+            target_path = base_dir / "decision_cache.db"
+
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        return str(target_path.resolve())
+    except (OSError, PermissionError) as err:
+        logger.warning(
+            "Permission or filesystem error determining cache db path for '%s': %s. Falling back to ':memory:'.",
+            raw_path,
+            err,
+        )
+        return ":memory:"
 
 
 class DeterministicCache:
@@ -151,11 +193,11 @@ class DeterministicCache:
 
     def __init__(
         self,
-        db_path: str = ":memory:",
+        db_path: Optional[str] = None,
         max_memory_items: int = 500,
         default_ignore_keys: Optional[Iterable[str]] = None,
     ):
-        self.db_path = db_path
+        self.db_path = get_default_cache_db_path(db_path)
         self.max_memory_items = max_memory_items
         self.default_ignore_keys = (
             {str(k).strip().lower().replace("-", "_") for k in default_ignore_keys}
@@ -167,16 +209,27 @@ class DeterministicCache:
         self._local = threading.local()
         self._shared_conn: Optional[sqlite3.Connection] = None
 
-        if self.db_path == ":memory:":
-            self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
-            self._shared_conn.row_factory = sqlite3.Row
-
         self.stats = {
             "hits": 0,
             "misses": 0,
             "tokens_saved": 0,
         }
-        self._init_db()
+
+        try:
+            if self.db_path == ":memory:":
+                self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
+                self._shared_conn.row_factory = sqlite3.Row
+            self._init_db()
+        except (sqlite3.OperationalError, OSError, PermissionError) as err:
+            logger.warning(
+                "SQLite database initialization error at %s (%s). Falling back to ':memory:'.",
+                self.db_path,
+                err,
+            )
+            self.db_path = ":memory:"
+            self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._shared_conn.row_factory = sqlite3.Row
+            self._init_db()
 
     @contextlib.contextmanager
     def _get_connection(self):
@@ -186,14 +239,29 @@ class DeterministicCache:
         else:
             conn = getattr(self._local, "conn", None)
             if conn is None:
-                conn = sqlite3.connect(self.db_path, timeout=20.0)
-                conn.row_factory = sqlite3.Row
                 try:
-                    conn.execute("PRAGMA journal_mode=WAL")
-                    conn.execute("PRAGMA synchronous=NORMAL")
-                except Exception as err:
-                    logger.debug("PRAGMA setup note: %s", err)
-                self._local.conn = conn
+                    conn = sqlite3.connect(self.db_path, timeout=20.0)
+                    conn.row_factory = sqlite3.Row
+                    try:
+                        conn.execute("PRAGMA journal_mode=WAL")
+                        conn.execute("PRAGMA synchronous=NORMAL")
+                    except Exception as err:
+                        logger.debug("PRAGMA setup note: %s", err)
+                    self._local.conn = conn
+                except (sqlite3.OperationalError, OSError, PermissionError) as err:
+                    logger.warning(
+                        "SQLite connection error to %s (%s). Falling back to shared :memory:.",
+                        self.db_path,
+                        err,
+                    )
+                    with self._lock:
+                        if self._shared_conn is None:
+                            self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False)
+                            self._shared_conn.row_factory = sqlite3.Row
+                            self._init_db()
+                    with self._lock:
+                        yield self._shared_conn
+                    return
             with self._lock:
                 yield conn
 
@@ -250,6 +318,10 @@ class DeterministicCache:
                     return sorted(items)
                 except TypeError:
                     return sorted(items, key=lambda x: str(x))
+            elif isinstance(data, float):
+                if math.isnan(data) or math.isinf(data):
+                    return None
+                return data
             return data
         finally:
             if obj_id is not None:
@@ -295,6 +367,7 @@ class DeterministicCache:
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
+            default=str,
         ).encode("utf-8")
         return hashlib.sha256(canonical_bytes).hexdigest()
 
@@ -304,7 +377,8 @@ class DeterministicCache:
                 self.stats["hits"] += 1
                 item = self._memory_lru[fingerprint]
                 self.stats["tokens_saved"] += item.get("tokens_estimate", 0)
-                item["hit_count"] = item.get("hit_count", 0) + 1
+                tokens = item.get("tokens_estimate", 0)
+                self._promote_lru(fingerprint, item["data"], tokens)
                 return item["data"]
 
         try:
@@ -337,7 +411,7 @@ class DeterministicCache:
         input_tokens_estimate: int = 0,
     ) -> None:
         try:
-            raw_json = json.dumps(response_data, separators=(",", ":"))
+            raw_json = json.dumps(response_data, separators=(",", ":"), default=str)
             with self._get_connection() as conn:
                 conn.execute(
                     """
@@ -367,12 +441,19 @@ class DeterministicCache:
         data: Dict[str, Any],
         tokens_estimate: int,
     ) -> None:
+        if fingerprint in self._memory_lru:
+            existing = self._memory_lru.pop(fingerprint)
+            hit_count = existing.get("hit_count", 0) + 1
+        else:
+            hit_count = 0
+
         if len(self._memory_lru) >= self.max_memory_items:
             oldest_key = next(iter(self._memory_lru))
             del self._memory_lru[oldest_key]
+
         self._memory_lru[fingerprint] = {
             "data": data,
-            "hit_count": 0,
+            "hit_count": hit_count,
             "tokens_estimate": tokens_estimate,
         }
 
@@ -471,28 +552,45 @@ class ResponseCalibrator:
     def _calibrate_choice(self, item: Dict[str, Any]) -> None:
         probs = item.get("probabilities", {})
         parsed_pairs: List[Tuple[str, float]] = []
+        has_invalid = False
         if isinstance(probs, dict):
             for k, v in probs.items():
                 try:
-                    parsed_pairs.append((str(k), float(v)))
+                    val = float(v)
+                    if math.isnan(val) or math.isinf(val):
+                        has_invalid = True
+                    else:
+                        parsed_pairs.append((str(k), val))
                 except (ValueError, TypeError):
-                    pass
+                    has_invalid = True
 
         if not parsed_pairs:
             try:
-                conf = float(item.get("confidence", 0.0))
+                raw_conf = item.get("confidence", 0.0)
+                conf = float(raw_conf)
+                if math.isnan(conf) or math.isinf(conf):
+                    conf = 0.0
+                    has_invalid = True
             except (ValueError, TypeError):
                 conf = 0.0
-            is_amb = conf < self.min_top_prob
+                has_invalid = True
+
+            reasons = []
+            if has_invalid:
+                reasons.append("invalid_probability")
+            if conf < self.min_top_prob:
+                reasons.append("low_confidence")
+
+            is_amb = len(reasons) > 0
             item["is_ambiguous"] = is_amb
             item["status"] = "AMBIGUOUS_STATE" if is_amb else "CONFIDENT"
             item["calibration"] = {
-                "dispersion_gap": conf,
-                "reasons": ["low_confidence"] if is_amb else [],
+                "dispersion_gap": round(conf, 4),
+                "reasons": reasons,
                 "runner_up_choice": None,
                 "runner_up_probability": 0.0,
                 "top_choice": item.get("choice"),
-                "top_probability": conf,
+                "top_probability": round(conf, 4),
             }
             return
 
@@ -502,6 +600,8 @@ class ResponseCalibrator:
         gap = top_p - runner_p
 
         reasons: List[str] = []
+        if has_invalid:
+            reasons.append("invalid_probability")
         if top_p < self.min_top_prob:
             reasons.append("low_confidence")
         if len(sorted_pairs) > 1 and gap < self.min_dispersion_gap:
@@ -520,15 +620,19 @@ class ResponseCalibrator:
         }
 
     def _calibrate_score(self, item: Dict[str, Any]) -> None:
+        reasons: List[str] = []
         try:
             conf = float(item.get("confidence", 1.0))
+            if math.isnan(conf) or math.isinf(conf):
+                conf = 0.0
+                reasons.append("invalid_probability")
         except (ValueError, TypeError):
             conf = 0.0
+            reasons.append("invalid_probability")
 
         probs = item.get("probabilities", {})
-        reasons: List[str] = []
 
-        if conf < self.min_top_prob:
+        if conf < self.min_top_prob and "low_confidence" not in reasons:
             reasons.append("low_confidence")
 
         dispersion_gap = conf
@@ -536,9 +640,15 @@ class ResponseCalibrator:
             parsed_probs: List[float] = []
             for v in probs.values():
                 try:
-                    parsed_probs.append(float(v))
+                    val = float(v)
+                    if math.isnan(val) or math.isinf(val):
+                        if "invalid_probability" not in reasons:
+                            reasons.append("invalid_probability")
+                    else:
+                        parsed_probs.append(val)
                 except (ValueError, TypeError):
-                    pass
+                    if "invalid_probability" not in reasons:
+                        reasons.append("invalid_probability")
             if len(parsed_probs) >= 2:
                 sorted_probs = sorted(parsed_probs, reverse=True)
                 top_p = sorted_probs[0]
@@ -546,7 +656,7 @@ class ResponseCalibrator:
                 dispersion_gap = top_p - runner_p
                 if top_p < self.min_top_prob and "low_confidence" not in reasons:
                     reasons.append("low_confidence")
-                if dispersion_gap < self.min_dispersion_gap:
+                if dispersion_gap < self.min_dispersion_gap and "flat_distribution" not in reasons:
                     reasons.append("flat_distribution")
 
         is_amb = len(reasons) > 0
@@ -565,6 +675,23 @@ class ResponseCalibrator:
         try:
             prob = float(val)
         except (ValueError, TypeError):
+            item["is_ambiguous"] = True
+            item["status"] = "AMBIGUOUS_STATE"
+            item["calibration"] = {
+                "boundary_distance": 0.0,
+                "probability": 0.0,
+                "reasons": ["invalid_probability"],
+            }
+            return
+
+        if math.isnan(prob) or math.isinf(prob):
+            item["is_ambiguous"] = True
+            item["status"] = "AMBIGUOUS_STATE"
+            item["calibration"] = {
+                "boundary_distance": 0.0,
+                "probability": 0.0,
+                "reasons": ["invalid_probability"],
+            }
             return
 
         dist = abs(prob - 0.50)
@@ -641,8 +768,10 @@ class QuestionOptimizer:
                 wire_dict["criteria"] = q["criteria"]
 
         elif q_type == "score":
-            criteria = q.get("criteria", [])
-            if not isinstance(criteria, list):
+            criteria = q.get("criteria")
+            if criteria is None:
+                criteria = []
+            elif not isinstance(criteria, list):
                 criteria = [criteria]
             wire_dict = {
                 "type": "score",
@@ -658,7 +787,10 @@ class QuestionOptimizer:
                 raw_crit = {}
             criteria = {str(k): str(v) for k, v in raw_crit.items()}
             closed = bool(q.get("closed_world", False))
-            allow_escape = q.get("auto_inject_escape", not closed)
+            allow_esc_opt = q.get("auto_inject_escape")
+            if allow_esc_opt is None:
+                allow_esc_opt = q.get("auto_inject_escapes")
+            allow_escape = bool(allow_esc_opt) if allow_esc_opt is not None else (not closed)
             wire_dict = {
                 "type": "choice",
                 "instructions": instructions,
@@ -717,13 +849,15 @@ class QuestionOptimizer:
 class ToolRegistry:
     """Registry maintaining tool schemas and operational handlers."""
 
-    def __init__(self, cache_db_path: str = ":memory:"):
+    def __init__(self, cache_db_path: Optional[str] = None):
+        self._lock = threading.RLock()
         self.cache = DeterministicCache(db_path=cache_db_path)
         self.optimizer = QuestionOptimizer()
         self.calibrator = ResponseCalibrator()
 
     def get_definitions(self) -> List[Dict[str, Any]]:
-        return [
+        with self._lock:
+            return [
             {
                 "name": "jevguard_evaluate",
                 "description": (
@@ -851,6 +985,11 @@ class ToolRegistry:
                             "description": "Target model identifier (default: jev-latest).",
                             "default": "jev-latest",
                         },
+                        "auto_inject_escapes": {
+                            "type": "boolean",
+                            "description": "Whether to consider escape injection logic when computing fingerprint (default: true).",
+                            "default": True,
+                        },
                         "ignore_keys": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -863,19 +1002,24 @@ class ToolRegistry:
         ]
 
     def execute_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        if not isinstance(arguments, dict):
-            raise ValueError(f"Tool arguments must be a dictionary, got {type(arguments).__name__}")
+        with self._lock:
+            if not isinstance(arguments, dict):
+                raise ValueError(f"Tool arguments must be a dictionary, got {type(arguments).__name__}")
 
-        if name == "jevguard_prune_state":
-            return self._tool_prune_state(arguments)
-        elif name == "jevguard_cache_fingerprint":
-            return self._tool_cache_fingerprint(arguments)
-        elif name == "jevguard_calibrate":
-            return self._tool_calibrate(arguments)
-        elif name == "jevguard_evaluate":
-            return self._tool_evaluate(arguments)
-        else:
-            raise KeyError(f"Unknown tool: '{name}'")
+            if name == "jevguard_prune_state":
+                return self._tool_prune_state(arguments)
+            elif name == "jevguard_cache_fingerprint":
+                return self._tool_cache_fingerprint(arguments)
+            elif name == "jevguard_calibrate":
+                return self._tool_calibrate(arguments)
+            elif name == "jevguard_evaluate":
+                return self._tool_evaluate(arguments)
+            else:
+                raise KeyError(f"Unknown tool: '{name}'")
+
+    def close(self) -> None:
+        with self._lock:
+            self.cache.close()
 
     def _tool_prune_state(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         if "state" not in arguments:
@@ -896,12 +1040,13 @@ class ToolRegistry:
         state = arguments["state"]
         questions = arguments.get("questions") or {}
         model = str(arguments.get("model", "jev-latest")).strip() or "jev-latest"
+        auto_inject = bool(arguments.get("auto_inject_escapes", True))
         ignore_keys = arguments.get("ignore_keys")
 
         wire_questions = questions
         if isinstance(questions, (dict, list)) and questions:
             try:
-                wire_questions, _ = self.optimizer.normalize_questions(questions, auto_inject_escapes=False)
+                wire_questions, _ = self.optimizer.normalize_questions(questions, auto_inject_escapes=auto_inject)
             except Exception:
                 wire_questions = questions
 
@@ -1021,12 +1166,11 @@ class ToolRegistry:
             raw_answers = dispatch_res.get("data", {}).get("answers", {})
         else:
             return {
+                "success": False,
+                "error": "TYPESAFE_API_KEY not configured in MCP settings or environment",
                 "cache_fingerprint": fingerprint,
-                "cached": False,
-                "notice": "Offline mode: set TYPESAFE_API_KEY or provide mock_answers to execute inference.",
-                "optimization": opt_metadata,
-                "success": True,
                 "wire_payload": wire_payload,
+                "optimization": opt_metadata,
             }
 
         t_cal0 = time.perf_counter()
@@ -1074,7 +1218,7 @@ class ToolRegistry:
         max_retries: int = 3,
         initial_backoff: float = 0.5,
     ) -> Dict[str, Any]:
-        raw_bytes = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        raw_bytes = json.dumps(payload, separators=(",", ":"), default=str).encode("utf-8")
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json; charset=utf-8",
@@ -1104,15 +1248,17 @@ class ToolRegistry:
 
             except urllib.error.HTTPError as err:
                 code = err.code
-                if code in (400, 401, 403, 404):
+                try:
                     err_body = err.read().decode("utf-8", errors="replace")
+                except Exception:
+                    err_body = str(err)
+                if code in (400, 401, 403, 404):
                     raise RuntimeError(f"HTTP {code} error from TypeSafe AI: {err_body}")
 
                 if attempts < max_attempts:
                     delay = initial_backoff * (2 ** (attempts - 1)) + random.uniform(0.05, 0.25)
                     time.sleep(delay)
                     continue
-                err_body = err.read().decode("utf-8", errors="replace")
                 raise RuntimeError(f"HTTP {code} failure after retries: {err_body}")
 
             except (socket.timeout, TimeoutError) as err:

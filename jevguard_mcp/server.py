@@ -8,11 +8,13 @@ import io
 import json
 import logging
 import sys
+import threading
 from typing import Any, Dict, Optional, TextIO
 
-from .tools import ToolRegistry
+from .tools import ToolRegistry, get_default_cache_db_path
 
 logger = logging.getLogger("jevguard.mcp.server")
+logger.addHandler(logging.NullHandler())
 
 PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "jevguard-mcp"
@@ -26,11 +28,12 @@ class MCPServer:
         self,
         name: str = SERVER_NAME,
         version: str = SERVER_VERSION,
-        cache_db_path: str = ":memory:",
+        cache_db_path: Optional[str] = None,
     ):
         self.name = name
         self.version = version
         self.protocol_version = PROTOCOL_VERSION
+        self._lock = threading.RLock()
         self.registry = ToolRegistry(cache_db_path=cache_db_path)
         self.initialized = False
         self.running = False
@@ -67,76 +70,77 @@ class MCPServer:
 
     def handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Handles a parsed JSON-RPC 2.0 message."""
-        if message.get("jsonrpc") != "2.0":
-            return {
-                "jsonrpc": "2.0",
-                "id": message.get("id"),
-                "error": {
-                    "code": -32600,
-                    "message": "Invalid Request: missing or invalid 'jsonrpc' field",
-                },
-            }
+        with self._lock:
+            if message.get("jsonrpc") != "2.0":
+                return {
+                    "jsonrpc": "2.0",
+                    "id": message.get("id"),
+                    "error": {
+                        "code": -32600,
+                        "message": "Invalid Request: missing or invalid 'jsonrpc' field",
+                    },
+                }
 
-        method = message.get("method")
-        msg_id = message.get("id")
-        is_notification = "id" not in message or msg_id is None
+            method = message.get("method")
+            msg_id = message.get("id")
+            is_notification = "id" not in message or msg_id is None
 
-        if not isinstance(method, str):
+            if not isinstance(method, str):
+                if is_notification:
+                    return None
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {
+                        "code": -32600,
+                        "message": "Invalid Request: 'method' must be a string",
+                    },
+                }
+
+            params = message.get("params", {})
+            if params is None:
+                params = {}
+            elif not isinstance(params, (dict, list)):
+                if is_notification:
+                    return None
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: params must be an object or array",
+                    },
+                }
+
+            # Handle notifications (no response permitted)
+            if method in ("notifications/initialized", "initialized"):
+                self.initialized = True
+                return None
+
+            if method in ("notifications/cancelled", "cancelled"):
+                return None
+
             if is_notification:
                 return None
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {
-                    "code": -32600,
-                    "message": "Invalid Request: 'method' must be a string",
-                },
-            }
 
-        params = message.get("params", {})
-        if params is None:
-            params = {}
-        elif not isinstance(params, (dict, list)):
-            if is_notification:
-                return None
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid params: params must be an object or array",
-                },
-            }
-
-        # Handle notifications (no response permitted)
-        if method in ("notifications/initialized", "initialized"):
-            self.initialized = True
-            return None
-
-        if method in ("notifications/cancelled", "cancelled"):
-            return None
-
-        if is_notification:
-            return None
-
-        # Handle request methods with mandatory response
-        if method == "initialize":
-            return self._handle_initialize(msg_id, params)
-        elif method == "ping":
-            return self._handle_ping(msg_id)
-        elif method == "tools/list":
-            return self._handle_tools_list(msg_id)
-        elif method == "tools/call":
-            return self._handle_tools_call(msg_id, params)
-        else:
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {
-                    "code": -32601,
-                    "message": f"Method not found: '{method}'",
-                },
-            }
+            # Handle request methods with mandatory response
+            if method == "initialize":
+                return self._handle_initialize(msg_id, params)
+            elif method == "ping":
+                return self._handle_ping(msg_id)
+            elif method == "tools/list":
+                return self._handle_tools_list(msg_id)
+            elif method == "tools/call":
+                return self._handle_tools_call(msg_id, params)
+            else:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {
+                        "code": -32601,
+                        "message": f"Method not found: '{method}'",
+                    },
+                }
 
     def _handle_initialize(self, msg_id: Any, params: Any) -> Dict[str, Any]:
         return {
@@ -210,7 +214,7 @@ class MCPServer:
 
         try:
             result_data = self.registry.execute_tool(name, arguments)
-            result_text = json.dumps(result_data, indent=2, sort_keys=True)
+            result_text = json.dumps(result_data, indent=2, sort_keys=True, default=str)
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
@@ -275,34 +279,83 @@ class MCPServer:
                     pass
             output_stream = sys.stdout
 
-        self.running = True
+        with self._lock:
+            self.running = True
+
         try:
-            for line in input_stream:
-                if not self.running:
+            while True:
+                with self._lock:
+                    if not self.running:
+                        break
+
+                try:
+                    line = input_stream.readline()
+                except (EOFError, KeyboardInterrupt):
                     break
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                except Exception as err:
+                    logger.debug("Input stream read error: %s", err)
+                    break
+
+                if not line:
+                    break
+
+                stripped = line.strip()
+                if not stripped:
+                    continue
+
                 response = self.handle_line(line)
                 if response is not None:
-                    serialized = json.dumps(
-                        response,
-                        separators=(",", ":"),
-                        ensure_ascii=False,
-                    )
-                    output_stream.write(serialized + "\n")
-                    output_stream.flush()
+                    try:
+                        serialized = json.dumps(
+                            response,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                            default=str,
+                        )
+                        with self._lock:
+                            output_stream.write(serialized + "\n")
+                            output_stream.flush()
+                    except (BrokenPipeError, ConnectionResetError):
+                        break
+                    except Exception as err:
+                        logger.debug("Output stream write error: %s", err)
+                        break
+
         except KeyboardInterrupt:
             pass
+        except Exception as err:
+            logger.debug("Event loop unexpected exception: %s", err)
         finally:
-            self.running = False
-            self.registry.cache.close()
+            with self._lock:
+                self.running = False
+                try:
+                    self.registry.close()
+                except Exception as err:
+                    logger.debug("Error closing registry: %s", err)
 
 
 def run_server() -> None:
     """Entry point creating and executing the MCP server over standard stdio."""
-    logging.basicConfig(
-        stream=sys.stderr,
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    try:
+        logging.basicConfig(
+            stream=sys.stderr,
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            force=True,
+        )
+    except TypeError:
+        logging.basicConfig(
+            stream=sys.stderr,
+            level=logging.INFO,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        )
+
+    for handler in logging.root.handlers:
+        if getattr(handler, "stream", None) is sys.stdout:
+            handler.stream = sys.stderr
+
     server = MCPServer()
     server.run_stdio()
 

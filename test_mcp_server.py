@@ -4,12 +4,17 @@ Implements 100% Python standard library (unittest, io, json, tempfile, os).
 Strictly adheres to Humanizer English standards.
 """
 
+import ast
 import io
 import json
 import math
 import os
+import pathlib
+import sys
 import tempfile
+import threading
 import unittest
+from unittest import mock
 
 from jevguard_mcp.server import MCPServer
 from jevguard_mcp.tools import (
@@ -19,6 +24,7 @@ from jevguard_mcp.tools import (
     ResponseCalibrator,
     StatePruner,
     ToolRegistry,
+    get_default_cache_db_path,
 )
 
 
@@ -317,6 +323,10 @@ class TestToolsCallExecution(unittest.TestCase):
 
     def setUp(self):
         self.server = MCPServer()
+        self.server.registry.cache.clear()
+
+    def tearDown(self):
+        self.server.registry.close()
 
     def test_call_prune_state_tool(self):
         call_msg = {
@@ -492,6 +502,453 @@ class TestServerStdioPipeline(unittest.TestCase):
             parsed = json.loads(line)
             self.assertEqual(parsed.get("jsonrpc"), "2.0")
             self.assertIn("id", parsed)
+
+
+
+
+class TestDeterministicCacheLRU(unittest.TestCase):
+    """Verifies LRU memory eviction ordering and hit promotion."""
+
+    def test_lru_capacity_eviction_and_hit_promotion(self):
+        cache = DeterministicCache(db_path=":memory:", max_memory_items=2)
+        cache.put("fp_1", "jev-latest", {"data": 1})
+        cache.put("fp_2", "jev-latest", {"data": 2})
+
+        # Access fp_1 to promote it to MRU position
+        res1 = cache.get("fp_1")
+        self.assertEqual(res1, {"data": 1})
+
+        # Inserting fp_3 should evict fp_2 (since fp_1 was promoted)
+        cache.put("fp_3", "jev-latest", {"data": 3})
+
+        self.assertIn("fp_1", cache._memory_lru)
+        self.assertIn("fp_3", cache._memory_lru)
+        self.assertNotIn("fp_2", cache._memory_lru)
+        cache.close()
+
+    def test_volatile_key_masking_handles_nan_and_inf(self):
+        state = {
+            "valid": 100,
+            "nan_val": float("nan"),
+            "inf_val": float("inf"),
+            "timestamp": 123456,
+        }
+        stripped = DeterministicCache._strip_volatile_keys(state, set(["timestamp"]))
+        self.assertEqual(stripped["valid"], 100)
+        self.assertIsNone(stripped["nan_val"])
+        self.assertIsNone(stripped["inf_val"])
+        self.assertNotIn("timestamp", stripped)
+
+
+class TestFingerprintParity(unittest.TestCase):
+    """Verifies fingerprint parity between jevguard_cache_fingerprint and jevguard_evaluate."""
+
+    def setUp(self):
+        self.registry = ToolRegistry()
+
+    def test_cache_fingerprint_matches_evaluate_fingerprint(self):
+        state = {"user_id": "usr_42", "timestamp": 1726700000}
+        questions = {
+            "intent": {
+                "type": "choice",
+                "instructions": "Identify intent",
+                "criteria": {"billing": "Billing inquiry", "support": "Tech support"},
+            }
+        }
+
+        fp_res = self.registry.execute_tool(
+            "jevguard_cache_fingerprint",
+            {
+                "state": state,
+                "questions": questions,
+                "model": "jev-latest",
+                "auto_inject_escapes": True,
+            },
+        )
+
+        eval_res = self.registry.execute_tool(
+            "jevguard_evaluate",
+            {
+                "state": state,
+                "questions": questions,
+                "model": "jev-latest",
+                "auto_inject_escapes": True,
+                "mock_answers": {
+                    "intent": {
+                        "type": "choice",
+                        "choice": "billing",
+                        "confidence": 0.95,
+                        "probabilities": {"billing": 0.95, "support": 0.05},
+                    }
+                },
+            },
+        )
+
+        self.assertEqual(fp_res["fingerprint"], eval_res["cache_fingerprint"])
+
+
+class TestCalibratorEdgeCases(unittest.TestCase):
+    """Verifies robust calibration against NaN and Inf probability payloads."""
+
+    def setUp(self):
+        self.calibrator = ResponseCalibrator()
+
+    def test_choice_with_nan_probability_flagged(self):
+        answers = {
+            "q1": {
+                "type": "choice",
+                "choice": "opt_a",
+                "confidence": 0.90,
+                "probabilities": {"opt_a": float("nan"), "opt_b": 0.10},
+            }
+        }
+        calibrated, summary = self.calibrator.calibrate(answers)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertIn("invalid_probability", calibrated["q1"]["calibration"]["reasons"])
+
+    def test_score_with_nan_confidence_flagged(self):
+        answers = {
+            "q1": {
+                "type": "score",
+                "score": 3,
+                "confidence": float("nan"),
+                "probabilities": {"1": 0.1, "3": 0.9},
+            }
+        }
+        calibrated, summary = self.calibrator.calibrate(answers)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertIn("invalid_probability", calibrated["q1"]["calibration"]["reasons"])
+
+    def test_noul_with_nan_or_inf_flagged(self):
+        answers = {
+            "q_nan": {"type": "noul", "noul": float("nan")},
+            "q_inf": {"type": "noul", "noul": float("inf")},
+        }
+        calibrated, summary = self.calibrator.calibrate(answers)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertIn("invalid_probability", calibrated["q_nan"]["calibration"]["reasons"])
+        self.assertIn("invalid_probability", calibrated["q_inf"]["calibration"]["reasons"])
+
+
+class TestQuestionOptimizerEdgeCases(unittest.TestCase):
+    """Verifies robustness of QuestionOptimizer against edge-case definitions."""
+
+    def setUp(self):
+        self.optimizer = QuestionOptimizer()
+
+    def test_score_question_with_none_criteria(self):
+        questions = {
+            "q_score": {
+                "type": "score",
+                "instructions": "Rate quality",
+                "criteria": None,
+            }
+        }
+        wire_questions, _ = self.optimizer.normalize_questions(questions)
+        self.assertEqual(wire_questions["q_score"]["criteria"], [])
+
+    def test_auto_inject_escape_override(self):
+        questions = {
+            "q_choice": {
+                "type": "choice",
+                "instructions": "Select option",
+                "criteria": {"a": "Alpha", "b": "Beta"},
+                "auto_inject_escape": False,
+            }
+        }
+        wire_questions, injected = self.optimizer.normalize_questions(questions, auto_inject_escapes=True)
+        self.assertNotIn("q_choice", injected)
+        self.assertNotIn(ESCAPE_OPTION_KEY, wire_questions["q_choice"]["criteria"])
+
+
+class TestAuditPoint1NoPrintAndStderrLogging(unittest.TestCase):
+    """Point 1: Verifies that print() is poisoned (never used) and logging uses sys.stderr exclusively."""
+
+    def test_no_print_in_jevguard_mcp_package(self):
+        package_dir = pathlib.Path(__file__).parent / "jevguard_mcp"
+        python_files = list(package_dir.glob("*.py"))
+        self.assertGreater(len(python_files), 0)
+
+        for py_file in python_files:
+            with open(py_file, "r", encoding="utf-8") as f:
+                source = f.read()
+            tree = ast.parse(source, filename=str(py_file))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Call):
+                    if isinstance(node.func, ast.Name) and node.func.id == "print":
+                        self.fail(f"Found forbidden print() call in {py_file.name} at line {node.lineno}")
+
+    def test_server_run_stdio_writes_only_valid_json_rpc(self):
+        server = MCPServer(cache_db_path=":memory:")
+        input_stream = io.StringIO('{"jsonrpc":"2.0","id":1,"method":"ping"}\n')
+        output_stream = io.StringIO()
+
+        server.run_stdio(input_stream=input_stream, output_stream=output_stream)
+        raw_output = output_stream.getvalue().strip()
+        self.assertTrue(raw_output)
+        lines = raw_output.splitlines()
+        self.assertEqual(len(lines), 1)
+        parsed = json.loads(lines[0])
+        self.assertEqual(parsed.get("jsonrpc"), "2.0")
+        self.assertEqual(parsed.get("id"), 1)
+
+    def test_logging_configuration_strictly_targets_stderr(self):
+        from jevguard_mcp.server import run_server
+        with mock.patch("jevguard_mcp.server.MCPServer") as mock_server_cls:
+            mock_server_instance = mock.MagicMock()
+            mock_server_cls.return_value = mock_server_instance
+            import logging
+            run_server()
+            for handler in logging.root.handlers:
+                stream = getattr(handler, "stream", None)
+                if stream is not None:
+                    self.assertIsNot(stream, sys.stdout)
+
+
+class TestAuditPoint2MissingEnvVariables(unittest.TestCase):
+    """Point 2: Missing TYPESAFE_API_KEY environment variable handling."""
+
+    def setUp(self):
+        self.env_patcher = mock.patch.dict(os.environ, {}, clear=True)
+        self.env_patcher.start()
+        self.server = MCPServer(cache_db_path=":memory:")
+
+    def tearDown(self):
+        self.env_patcher.stop()
+
+    def test_handshake_and_listing_without_api_key(self):
+        resp_init = self.server.handle_message({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+        })
+        self.assertEqual(resp_init["result"]["serverInfo"]["name"], "jevguard-mcp")
+
+        resp_notif = self.server.handle_message({
+            "jsonrpc": "2.0", "method": "notifications/initialized"
+        })
+        self.assertIsNone(resp_notif)
+
+        resp_ping = self.server.handle_message({
+            "jsonrpc": "2.0", "id": 2, "method": "ping"
+        })
+        self.assertEqual(resp_ping["result"], {})
+
+        resp_tools = self.server.handle_message({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/list", "params": {}
+        })
+        self.assertEqual(len(resp_tools["result"]["tools"]), 4)
+
+    def test_evaluate_without_api_key_returns_structured_error(self):
+        state = {"order_id": "ord_100"}
+        questions = {
+            "q1": {
+                "type": "choice",
+                "instructions": "Determine priority",
+                "criteria": {"high": "High priority", "low": "Low priority"},
+            }
+        }
+
+        call_msg = {
+            "jsonrpc": "2.0",
+            "id": 101,
+            "method": "tools/call",
+            "params": {
+                "name": "jevguard_evaluate",
+                "arguments": {
+                    "state": state,
+                    "questions": questions,
+                },
+            },
+        }
+
+        resp = self.server.handle_message(call_msg)
+        self.assertIsNotNone(resp)
+        self.assertFalse(resp.get("result", {}).get("isError", True))
+        content = json.loads(resp["result"]["content"][0]["text"])
+
+        self.assertFalse(content["success"])
+        self.assertEqual(content["error"], "TYPESAFE_API_KEY not configured in MCP settings or environment")
+        self.assertIn("cache_fingerprint", content)
+        self.assertIn("wire_payload", content)
+        self.assertIn("optimization", content)
+
+    def test_local_tools_and_cache_hits_work_100_percent_offline(self):
+        res_prune = self.server.registry.execute_tool(
+            "jevguard_prune_state",
+            {"state": {"a": 1, "b": None, "c": ""}}
+        )
+        self.assertEqual(res_prune["pruned_state"], {"a": 1})
+
+        res_calib = self.server.registry.execute_tool(
+            "jevguard_calibrate",
+            {
+                "answers": {
+                    "q1": {
+                        "type": "choice",
+                        "choice": "yes",
+                        "confidence": 0.95,
+                        "probabilities": {"yes": 0.95, "no": 0.05},
+                    }
+                }
+            }
+        )
+        self.assertEqual(res_calib["summary"]["verdict"], "CONFIDENT")
+
+        res_fp = self.server.registry.execute_tool(
+            "jevguard_cache_fingerprint",
+            {"state": {"user": "alice"}}
+        )
+        self.assertIn("fingerprint", res_fp)
+
+        # First prime cache with mock_answers
+        prime_res = self.server.registry.execute_tool(
+            "jevguard_evaluate",
+            {
+                "state": {"user": "offline_user"},
+                "questions": {"q": {"type": "choice", "instructions": "test", "criteria": {"a": "A", "b": "B"}}},
+                "mock_answers": {"q": {"type": "choice", "choice": "a", "confidence": 0.99, "probabilities": {"a": 0.99, "b": 0.01}}},
+            }
+        )
+        self.assertTrue(prime_res["success"])
+        self.assertFalse(prime_res["cached"])
+
+        # Second call with NO mock_answers and NO api_key must hit cache cleanly and succeed offline
+        cached_res = self.server.registry.execute_tool(
+            "jevguard_evaluate",
+            {
+                "state": {"user": "offline_user"},
+                "questions": {"q": {"type": "choice", "instructions": "test", "criteria": {"a": "A", "b": "B"}}},
+            }
+        )
+        self.assertTrue(cached_res["success"])
+        self.assertTrue(cached_res["cached"])
+        self.assertEqual(cached_res["telemetry"]["mode"], "deterministic_cache_hit")
+
+
+class TestAuditPoint3CacheDatabasePath(unittest.TestCase):
+    """Point 3: Verifies default SQLite cache path in ~/.cache/jevguard and memory fallback."""
+
+    def test_default_cache_db_path_resolution(self):
+        default_path = get_default_cache_db_path()
+        expected_base = pathlib.Path.home() / ".cache" / "jevguard" / "decision_cache.db"
+        self.assertEqual(pathlib.Path(default_path), expected_base.resolve())
+
+    def test_memory_path_preserved(self):
+        self.assertEqual(get_default_cache_db_path(":memory:"), ":memory:")
+
+    def test_relative_path_resolved_inside_cache_directory(self):
+        resolved = get_default_cache_db_path("my_cache.db")
+        expected = pathlib.Path.home() / ".cache" / "jevguard" / "my_cache.db"
+        self.assertEqual(pathlib.Path(resolved), expected.resolve())
+        self.assertFalse(os.path.exists("my_cache.db"))
+
+    def test_env_override_supported(self):
+        with mock.patch.dict(os.environ, {"JEVGUARD_CACHE_PATH": "env_override.db"}):
+            resolved = get_default_cache_db_path()
+            expected = pathlib.Path.home() / ".cache" / "jevguard" / "env_override.db"
+            self.assertEqual(pathlib.Path(resolved), expected.resolve())
+
+        with mock.patch.dict(os.environ, {"JEVGUARD_CACHE_PATH": ":memory:"}):
+            self.assertEqual(get_default_cache_db_path(), ":memory:")
+
+    def test_permission_failure_falls_back_to_memory(self):
+        with mock.patch("pathlib.Path.mkdir", side_effect=PermissionError("Mock Permission Denied")):
+            fallback_path = get_default_cache_db_path("custom_fail.db")
+            self.assertEqual(fallback_path, ":memory:")
+
+
+class TestAuditPoint4JSONSerializationSafety(unittest.TestCase):
+    """Point 4: Serialization of pure JSON primitives and default=str resiliency."""
+
+    def test_all_tools_return_pure_primitives(self):
+        registry = ToolRegistry(cache_db_path=":memory:")
+        res1 = registry.execute_tool("jevguard_prune_state", {"state": {"list": [1, 2], "float": 3.14}})
+        self.assertIsInstance(res1, dict)
+        json.dumps(res1)
+
+        res2 = registry.execute_tool("jevguard_cache_fingerprint", {"state": {"k": "v"}})
+        self.assertIsInstance(res2, dict)
+        json.dumps(res2)
+
+        res3 = registry.execute_tool("jevguard_calibrate", {"answers": {"q": {"type": "choice", "confidence": 0.5}}})
+        self.assertIsInstance(res3, dict)
+        json.dumps(res3)
+
+    def test_server_serializes_non_serializable_objects_via_default_str(self):
+        server = MCPServer(cache_db_path=":memory:")
+        class NonSerializableObject:
+            def __str__(self):
+                return "<NonSerializableObjectInstance>"
+
+        test_payload = {"key": NonSerializableObject(), "number": 123}
+        with mock.patch.object(server.registry, "execute_tool", return_value=test_payload):
+            call_msg = {
+                "jsonrpc": "2.0",
+                "id": 999,
+                "method": "tools/call",
+                "params": {"name": "jevguard_prune_state", "arguments": {"state": {}}},
+            }
+            resp = server.handle_message(call_msg)
+            self.assertFalse(resp["result"]["isError"])
+            content = json.loads(resp["result"]["content"][0]["text"])
+            self.assertEqual(content["key"], "<NonSerializableObjectInstance>")
+
+
+class TestAuditPoint5ConcurrencyAndStdioLifecycle(unittest.TestCase):
+    """Point 5: Thread safety with RLock and graceful EOF / KeyboardInterrupt."""
+
+    def test_concurrent_tool_execution_thread_safety(self):
+        registry = ToolRegistry(cache_db_path=":memory:")
+        errors = []
+
+        def worker(thread_id):
+            try:
+                for i in range(25):
+                    registry.execute_tool("jevguard_prune_state", {"state": {"thread": thread_id, "i": i}})
+                    registry.execute_tool(
+                        "jevguard_calibrate",
+                        {"answers": {f"q_{i}": {"type": "choice", "confidence": 0.8, "probabilities": {"a": 0.8, "b": 0.2}}}}
+                    )
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=worker, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        self.assertEqual(len(errors), 0)
+
+    def test_run_stdio_handles_eof_cleanly(self):
+        server = MCPServer(cache_db_path=":memory:")
+        input_stream = io.StringIO("")
+        output_stream = io.StringIO()
+        server.run_stdio(input_stream=input_stream, output_stream=output_stream)
+        self.assertEqual(output_stream.getvalue(), "")
+
+    def test_run_stdio_handles_keyboard_interrupt_cleanly(self):
+        server = MCPServer(cache_db_path=":memory:")
+        mock_stream = mock.MagicMock()
+        mock_stream.readline.side_effect = KeyboardInterrupt()
+        output_stream = io.StringIO()
+
+        server.run_stdio(input_stream=mock_stream, output_stream=output_stream)
+        self.assertFalse(server.running)
+
+
+class TestAuditPoint6PyprojectToml(unittest.TestCase):
+    """Point 6: Verification of zero dependencies and scripts entrypoint in pyproject.toml."""
+
+    def test_pyproject_toml_configuration(self):
+        pyproject_path = pathlib.Path(__file__).parent / "pyproject.toml"
+        self.assertTrue(pyproject_path.exists())
+
+        with open(pyproject_path, "r", encoding="utf-8") as f:
+            content = f.read()
+
+        self.assertIn("dependencies = []", content)
+        self.assertIn("[project.scripts]", content)
+        self.assertIn('jevguard-mcp = "jevguard_mcp.server:main"', content)
 
 
 if __name__ == "__main__":
