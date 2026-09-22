@@ -1,0 +1,11 @@
+# Smithery configuration for JevGuard MCP
+startCommand:
+  type: stdio
+  config:
+    command: "jevguard-mcp"
+    args: []
+    env:
+      TYPESAFE_API_KEY:
+        type: string
+        description: "TypeSafe AI API key for upstream evaluation"
+        required: false
