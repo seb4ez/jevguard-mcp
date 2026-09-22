@@ -63,7 +63,7 @@ class TestProtocolHandshake(unittest.TestCase):
         result = response.get("result", {})
         self.assertEqual(result.get("protocolVersion"), "2024-11-05")
         self.assertEqual(result.get("serverInfo", {}).get("name"), "jevguard-mcp")
-        self.assertEqual(result.get("serverInfo", {}).get("version"), "1.0.0")
+        self.assertEqual(result.get("serverInfo", {}).get("version"), "1.0.1")
         self.assertIn("tools", result.get("capabilities", {}))
 
     def test_notifications_initialized_produces_no_response(self):

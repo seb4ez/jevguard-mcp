@@ -19,7 +19,7 @@ This package exposes core JevGuard primitives through JSON-RPC 2.0 over standard
 
 A live comparison was conducted directly against the official TypeSafe AI endpoint (`https://api.typesafe.ai/v1/systemone`, model `jev-latest`) comparing 5 direct API calls against 5 JevGuard MCP tool calls from a development workstation.
 
-![JevGuard MCP Benchmark](benchmark_results.png)
+![JevGuard MCP Benchmark](https://raw.githubusercontent.com/seb4ez/jevguard-mcp/main/benchmark_results.png)
 
 ### Key Empirical Observations
 
