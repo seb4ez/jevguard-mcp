@@ -1,6 +1,10 @@
 # JevGuard MCP Server
 
-Official Model Context Protocol (MCP) server for JevGuard, providing a deterministic local caching, state sanitization, and guardrail layer for TypeSafe AI's System One decision model.
+[![PyPI version](https://img.shields.io/pypi/v/jevguard-mcp.svg)](https://pypi.org/project/jevguard-mcp/)
+[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-brightgreen.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
+Official Model Context Protocol (MCP) server for [JevGuard](https://github.com/seb4ez/jevguard), providing a deterministic local caching, state sanitization, and guardrail layer for TypeSafe AI's System One decision model. Available on PyPI as [`jevguard-mcp`](https://pypi.org/project/jevguard-mcp/).
 
 This package exposes core JevGuard primitives through JSON-RPC 2.0 over standard input/output (stdio), adhering to the MCP 2024-11-05 specification.
 
@@ -109,14 +113,21 @@ Calculates a canonical SHA-256 fingerprint:
 
 ## Installation
 
-Install the package directly in editable mode or as a standalone module using standard Python:
+Install the official package directly from PyPI:
 
 ```bash
-cd /path/to/jevguard-mcp
+pip install jevguard-mcp
+```
+
+Or install in editable mode from source:
+
+```bash
+git clone https://github.com/seb4ez/jevguard-mcp.git
+cd jevguard-mcp
 pip install -e .
 ```
 
-Alternatively, run directly with Python without installing:
+After installation, the executable CLI `jevguard-mcp` is immediately available in your environment path. Alternatively, run directly with Python without installing:
 
 ```bash
 python -m jevguard_mcp.server
