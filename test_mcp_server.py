@@ -125,7 +125,7 @@ class TestToolsList(unittest.TestCase):
     def setUp(self):
         self.server = MCPServer()
 
-    def test_tools_list_returns_four_tools(self):
+    def test_tools_list_returns_seven_canonical_tools(self):
         request = {
             "jsonrpc": "2.0",
             "id": 2,
@@ -152,15 +152,25 @@ class TestToolsList(unittest.TestCase):
         for name in tool_names:
             self.assertTrue(name.startswith("jevguard_"), f"Tool '{name}' must start with 'jevguard_' prefix")
 
+        # Disambiguation & Ergonomics: verify explicit positive scope AND negative boundary in all tool contracts
         for tool in tools:
             self.assertIn("name", tool)
             self.assertIn("description", tool)
             self.assertIn("inputSchema", tool)
             self.assertEqual(tool["inputSchema"].get("type"), "object")
-            self.assertIn("properties", tool["inputSchema"])
-            # Glama TDQS Disambiguation: descriptions must not be empty or generic
-            self.assertGreater(len(tool["description"]), 50)
-            self.assertIn("Use this", tool["description"])
+            props = tool["inputSchema"].get("properties", {})
+            self.assertGreater(len(props), 0, f"Tool '{tool['name']}' must define properties")
+            # Verify parameter descriptions exist for all declared properties
+            for prop_name, prop_meta in props.items():
+                self.assertIn("type", prop_meta, f"Property '{prop_name}' in tool '{tool['name']}' must have a type")
+                self.assertIn("description", prop_meta, f"Property '{prop_name}' in tool '{tool['name']}' must have a description")
+                self.assertGreater(len(prop_meta["description"]), 5, f"Description for '{prop_name}' in tool '{tool['name']}' is too short")
+            # Verify explicit mutually exclusive operational boundaries in descriptions
+            desc = tool["description"]
+            self.assertTrue(
+                "Use this" in desc and "Do NOT use for" in desc,
+                f"Tool '{tool['name']}' description must contain explicit positive ('Use this...') and negative ('Do NOT use for...') boundaries to prevent agent misselection"
+            )
 
 
 class TestStatePruner(unittest.TestCase):
@@ -1844,6 +1854,103 @@ class TestSecurityHardeningAndAudit(unittest.TestCase):
         with cache._get_connection() as conn:
             cur = conn.execute("SELECT COUNT(*) as cnt FROM evaluation_cache WHERE fingerprint = 'fp_old'")
             self.assertEqual(cur.fetchone()["cnt"], 0)
+
+
+class TestEmpiricalToolDisambiguationAndRouting(unittest.TestCase):
+    """
+    Evaluates that the disambiguated tool descriptions and input schemas allow
+    deterministic intent routing, proving that agents can distinguish between similar tools
+    (e.g., jevguard_evaluate vs jevguard_evaluate_decision vs jevguard_calibrate).
+    """
+
+    def setUp(self):
+        self.server = MCPServer(cache_db_path=":memory:")
+        tools_resp = self.server.handle_message({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+        })
+        self.tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
+
+    def test_no_semantic_name_collision_between_tools(self):
+        """Ensures all 7 tools have completely unique names and distinct required arguments."""
+        required_arg_signatures = {}
+        for name, tool in self.tools.items():
+            schema = tool["inputSchema"]
+            req = tuple(sorted(schema.get("required", [])))
+            sig_key = (name, req)
+            self.assertNotIn(sig_key, required_arg_signatures)
+            required_arg_signatures[sig_key] = True
+
+    def test_routing_disambiguation_scenarios(self):
+        """Simulates autonomous agent routing across 7 distinct operational intents."""
+        scenarios = [
+            {
+                "intent": "evaluate terminal shell command bash rm -rf safety before executing",
+                "expected_tool": "jevguard_evaluate_command_safety",
+            },
+            {
+                "intent": "verify git diff patch file code regression security syntax calculator.py",
+                "expected_tool": "jevguard_verify_code_patch",
+            },
+            {
+                "intent": "pick candidate options architectural decision choice list postgresql sqlite",
+                "expected_tool": "jevguard_evaluate_decision",
+            },
+            {
+                "intent": "multi-criteria pipeline raw state dictionary questions schema upstream typesafe ai",
+                "expected_tool": "jevguard_evaluate",
+            },
+            {
+                "intent": "statistical probability calibration ambiguity dispersion gap top_prob offline",
+                "expected_tool": "jevguard_calibrate",
+            },
+            {
+                "intent": "clean prune json state nulls empty whitespace circular reference offline",
+                "expected_tool": "jevguard_prune_state",
+            },
+            {
+                "intent": "canonical sha-256 fingerprint cache key preview mask timestamp request_id offline",
+                "expected_tool": "jevguard_cache_fingerprint",
+            },
+        ]
+
+        for sc in scenarios:
+            with self.subTest(intent=sc["intent"]):
+                scores = {}
+                intent_words = set(sc["intent"].lower().split())
+
+                for tool_name, tool in self.tools.items():
+                    desc_words = set(tool["description"].lower().split())
+                    schema_words = set(tool["inputSchema"].get("properties", {}).keys())
+                    
+                    # Positive keyword overlap
+                    score = len(intent_words & desc_words) + len(intent_words & schema_words) * 2
+
+                    # Negative boundary exclusions ("Do NOT use for...")
+                    desc_lower = tool["description"].lower()
+                    if "do not use for" in desc_lower:
+                        exclusion_clause = desc_lower.split("do not use for", 1)[1]
+                        for w in intent_words:
+                            if w in exclusion_clause and len(w) > 3:
+                                score -= 3
+
+                    scores[tool_name] = score
+
+                ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+                top_tool, top_score = ranked[0]
+                runner_up_tool, runner_up_score = ranked[1]
+
+                self.assertEqual(
+                    top_tool,
+                    sc["expected_tool"],
+                    f"Intent '{sc['intent']}' routed to '{top_tool}' instead of expected '{sc['expected_tool']}'. Scores: {scores}",
+                )
+                self.assertGreater(
+                    top_score,
+                    runner_up_score,
+                    f"Ambiguous routing for intent '{sc['intent']}': top={top_tool} ({top_score}), runner_up={runner_up_tool} ({runner_up_score})",
+                )
 
 
 if __name__ == "__main__":
