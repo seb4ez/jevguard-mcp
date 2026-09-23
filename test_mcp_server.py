@@ -1856,11 +1856,12 @@ class TestSecurityHardeningAndAudit(unittest.TestCase):
             self.assertEqual(cur.fetchone()["cnt"], 0)
 
 
-class TestEmpiricalToolDisambiguationAndRouting(unittest.TestCase):
+class TestDescriptionKeywordSeparation(unittest.TestCase):
     """
-    Evaluates that the disambiguated tool descriptions and input schemas allow
-    deterministic intent routing, proving that agents can distinguish between similar tools
-    (e.g., jevguard_evaluate vs jevguard_evaluate_decision vs jevguard_calibrate).
+    Heuristic smoke test verifying that tool descriptions maintain distinct keyword
+    vocabularies and mutual exclusion clauses under a basic bag-of-words check.
+    Note: This is a static lexical check on description wording, not an empirical
+    benchmark of LLM agent tool selection accuracy.
     """
 
     def setUp(self):
@@ -1872,18 +1873,14 @@ class TestEmpiricalToolDisambiguationAndRouting(unittest.TestCase):
         })
         self.tools = {t["name"]: t for t in tools_resp["result"]["tools"]}
 
-    def test_no_semantic_name_collision_between_tools(self):
-        """Ensures all 7 tools have completely unique names and distinct required arguments."""
-        required_arg_signatures = {}
-        for name, tool in self.tools.items():
-            schema = tool["inputSchema"]
-            req = tuple(sorted(schema.get("required", [])))
-            sig_key = (name, req)
-            self.assertNotIn(sig_key, required_arg_signatures)
-            required_arg_signatures[sig_key] = True
+    def test_tools_list_names_uniqueness(self):
+        """Verifies that all declared tool names in tools/list are unique."""
+        names = [t["name"] for t in self.tools.values()]
+        self.assertEqual(len(names), len(set(names)), "Tool names in tools/list must be unique")
+        self.assertEqual(len(names), 7)
 
-    def test_routing_disambiguation_scenarios(self):
-        """Simulates autonomous agent routing across 7 distinct operational intents."""
+    def test_lexical_keyword_separation_across_descriptions(self):
+        """Verifies that tool descriptions have distinctive lexical focus and do not overlap on core domain terms."""
         scenarios = [
             {
                 "intent": "evaluate terminal shell command bash rm -rf safety before executing",
@@ -1944,12 +1941,12 @@ class TestEmpiricalToolDisambiguationAndRouting(unittest.TestCase):
                 self.assertEqual(
                     top_tool,
                     sc["expected_tool"],
-                    f"Intent '{sc['intent']}' routed to '{top_tool}' instead of expected '{sc['expected_tool']}'. Scores: {scores}",
+                    f"Intent '{sc['intent']}' scored highest on '{top_tool}' instead of expected '{sc['expected_tool']}'. Scores: {scores}",
                 )
                 self.assertGreater(
                     top_score,
                     runner_up_score,
-                    f"Ambiguous routing for intent '{sc['intent']}': top={top_tool} ({top_score}), runner_up={runner_up_tool} ({runner_up_score})",
+                    f"Lexical overlap detected for intent '{sc['intent']}': top={top_tool} ({top_score}), runner_up={runner_up_tool} ({runner_up_score})",
                 )
 
 
