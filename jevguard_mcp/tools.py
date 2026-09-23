@@ -1054,8 +1054,11 @@ class ToolRegistry:
             {
                 "name": "jevguard_evaluate",
                 "description": (
-                    "Executes the deterministic JevGuard evaluation pipeline including state pruning, "
-                    "closed-world escape injection, certainty calibration, and 0-token caching."
+                    "Executes the full deterministic multi-criteria JevGuard pipeline on an arbitrary state "
+                    "object against structured question definitions (noul, score, choice). Use this low-level "
+                    "tool ONLY for complex, multi-criteria evaluations with custom question dictionaries "
+                    "against the upstream TypeSafe AI engine. Do NOT use for simple command checks, code "
+                    "patch reviews, or single-choice decisions (use the dedicated jevguard_* tools instead)."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1095,8 +1098,10 @@ class ToolRegistry:
             {
                 "name": "jevguard_calibrate",
                 "description": (
-                    "Evaluates probability distributions across answers to identify ambiguity, "
-                    "low confidence (top_prob < 0.40), and flat distributions (dispersion_gap < 0.15)."
+                    "Performs offline statistical certainty calibration on a pre-computed dictionary of answer "
+                    "probabilities without network calls. Use this tool ONLY to detect low confidence "
+                    "(top_prob < 0.40) or flat dispersion gaps (< 0.15) on already-evaluated probability outputs. "
+                    "Do NOT use for evaluating raw state, running commands, or making decisions."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1127,8 +1132,10 @@ class ToolRegistry:
             {
                 "name": "jevguard_prune_state",
                 "description": (
-                    "Sanitizes and prunes complex JSON state payloads by removing nulls, empty collections, "
-                    "collapsing whitespace, and protecting against cyclic references."
+                    "Sanitizes and prunes an arbitrary JSON state payload offline by removing null values, "
+                    "empty collections, and collapsing redundant whitespace while safeguarding against circular "
+                    "references. Use this utility tool ONLY for cleaning and minimizing state payloads prior "
+                    "to transmission or hashing. Do NOT use for evaluating safety or calibrating probabilities."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1149,8 +1156,10 @@ class ToolRegistry:
             {
                 "name": "jevguard_cache_fingerprint",
                 "description": (
-                    "Calculates a canonical SHA-256 fingerprint from state and questions with volatile "
-                    "key masking (timestamp, trace_id, request_id) for 0-token deterministic caching."
+                    "Calculates a canonical SHA-256 cache fingerprint for a state and model offline, "
+                    "deterministically sorting keys and masking volatile ephemeral fields (timestamps, trace IDs, "
+                    "request IDs). Use this tool ONLY to preview or verify the deterministic cache key of a payload "
+                    "without executing evaluation. Do NOT use for pruning state or executing decisions."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1183,11 +1192,13 @@ class ToolRegistry:
                 },
             },
             {
-                "name": "evaluate_command_safety",
+                "name": "jevguard_evaluate_command_safety",
                 "description": (
-                    "Evaluates terminal/shell command safety for autonomous agents. Determines whether a command "
-                    "is destructive, requires human approval, or can execute autonomously using Noul, Score, "
-                    "and Choice certainty calibration. Returns policy: ALLOW_AUTONOMOUS, REQUIRE_HUMAN_APPROVAL, or DENY_DESTRUCTIVE."
+                    "Evaluates the safety and blast radius of a terminal shell command (bash, sh, powershell, cmd) "
+                    "before execution. Use this tool ONLY to evaluate shell command strings for destructive actions, "
+                    "privilege risks, and autonomous execution safety. Do NOT use for evaluating code diffs, "
+                    "architectural decisions, or general probability calibrations. Returns an execution policy: "
+                    "ALLOW_AUTONOMOUS, REQUIRE_HUMAN_APPROVAL, or DENY_DESTRUCTIVE."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1221,10 +1232,12 @@ class ToolRegistry:
                 },
             },
             {
-                "name": "verify_code_patch",
+                "name": "jevguard_verify_code_patch",
                 "description": (
-                    "Evaluates whether a code diff or patch introduces security regressions, broken syntax, "
-                    "or critical system impact under a configurable risk tolerance (strict, balanced, permissive)."
+                    "Verifies a unified git diff or code patch before applying it to a file. Use this tool ONLY "
+                    "to inspect code modifications, patches, or diffs for regressions, syntax errors, and security "
+                    "vulnerabilities under a specified risk tolerance. Do NOT use for terminal command execution "
+                    "or general decisions. Returns approved boolean and recommendation (APPROVE, REQUEST_CHANGES, REJECT)."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1258,10 +1271,13 @@ class ToolRegistry:
                 },
             },
             {
-                "name": "evaluate_decision",
+                "name": "jevguard_evaluate_decision",
                 "description": (
-                    "Evaluates architectural and implementation decisions with a simple list of options. "
-                    "Automatically injects closed-world neutral escape (UNRESOLVED_OR_OTHER) and calibrates probability dispersion."
+                    "Selects the most suitable option from a discrete list of candidate choices (e.g. ['A', 'B', 'C']) "
+                    "given contextual background. Use this tool ONLY when choosing between specific named options "
+                    "or resolving high-level architectural decisions with closed-world escape fallback. Do NOT use "
+                    "for terminal commands, code diffs, or raw multi-criteria state evaluations. Returns the selected "
+                    "option, confidence score, and ambiguity status."
                 ),
                 "inputSchema": {
                     "type": "object",
@@ -1296,8 +1312,14 @@ class ToolRegistry:
         ]
 
     def get_tool_allowed_properties(self, tool_name: str) -> Optional[Set[str]]:
+        aliases = {
+            "evaluate_command_safety": "jevguard_evaluate_command_safety",
+            "verify_code_patch": "jevguard_verify_code_patch",
+            "evaluate_decision": "jevguard_evaluate_decision",
+        }
+        lookup_name = aliases.get(tool_name, tool_name)
         for item in self.get_definitions():
-            if item.get("name") == tool_name:
+            if item.get("name") == lookup_name:
                 schema = item.get("inputSchema", {})
                 props = schema.get("properties", {})
                 return set(props.keys())
@@ -1320,6 +1342,10 @@ class ToolRegistry:
                 "jevguard_cache_fingerprint": self._tool_cache_fingerprint,
                 "jevguard_calibrate": self._tool_calibrate,
                 "jevguard_evaluate": self._tool_evaluate,
+                "jevguard_evaluate_command_safety": self._tool_evaluate_command_safety,
+                "jevguard_verify_code_patch": self._tool_verify_code_patch,
+                "jevguard_evaluate_decision": self._tool_evaluate_decision,
+                # Backward compatibility aliases for legacy clients
                 "evaluate_command_safety": self._tool_evaluate_command_safety,
                 "verify_code_patch": self._tool_verify_code_patch,
                 "evaluate_decision": self._tool_evaluate_decision,

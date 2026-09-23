@@ -25,7 +25,7 @@ logger.addHandler(logging.NullHandler())
 
 PROTOCOL_VERSION: str = "2024-11-05"
 SERVER_NAME: str = "jevguard-mcp"
-SERVER_VERSION: str = "1.0.1"
+SERVER_VERSION: str = "1.0.2"
 
 
 class MCPServer:

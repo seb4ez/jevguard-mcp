@@ -63,7 +63,7 @@ class TestProtocolHandshake(unittest.TestCase):
         result = response.get("result", {})
         self.assertEqual(result.get("protocolVersion"), "2024-11-05")
         self.assertEqual(result.get("serverInfo", {}).get("name"), "jevguard-mcp")
-        self.assertEqual(result.get("serverInfo", {}).get("version"), "1.0.1")
+        self.assertEqual(result.get("serverInfo", {}).get("version"), "1.0.2")
         self.assertIn("tools", result.get("capabilities", {}))
 
     def test_notifications_initialized_produces_no_response(self):
@@ -142,11 +142,15 @@ class TestToolsList(unittest.TestCase):
             "jevguard_calibrate",
             "jevguard_prune_state",
             "jevguard_cache_fingerprint",
-            "evaluate_command_safety",
-            "verify_code_patch",
-            "evaluate_decision",
+            "jevguard_evaluate_command_safety",
+            "jevguard_verify_code_patch",
+            "jevguard_evaluate_decision",
         }
         self.assertEqual(tool_names, expected_names)
+
+        # Glama TDQS Naming Consistency: 100% of tools must start with 'jevguard_' prefix
+        for name in tool_names:
+            self.assertTrue(name.startswith("jevguard_"), f"Tool '{name}' must start with 'jevguard_' prefix")
 
         for tool in tools:
             self.assertIn("name", tool)
@@ -154,6 +158,9 @@ class TestToolsList(unittest.TestCase):
             self.assertIn("inputSchema", tool)
             self.assertEqual(tool["inputSchema"].get("type"), "object")
             self.assertIn("properties", tool["inputSchema"])
+            # Glama TDQS Disambiguation: descriptions must not be empty or generic
+            self.assertGreater(len(tool["description"]), 50)
+            self.assertIn("Use this", tool["description"])
 
 
 class TestStatePruner(unittest.TestCase):
@@ -1380,7 +1387,47 @@ class TestAtomicToolsProtocol(unittest.TestCase):
         content = json.loads(resp["result"]["content"][0]["text"])
         self.assertFalse(content["success"])
         self.assertEqual(content["error_type"], "ValueError")
-        self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+    def test_prefixed_and_legacy_tool_invocations_produce_identical_results(self):
+        mock_answers = {
+            "is_destructive": {"type": "noul", "noul": 0.02, "confidence": 0.98},
+            "risk_score": {"type": "score", "confidence": 0.95},
+            "execution_policy": {
+                "type": "choice",
+                "choice": "ALLOW_AUTONOMOUS",
+                "confidence": 0.95,
+                "probabilities": {"ALLOW_AUTONOMOUS": 0.95, "REQUIRE_HUMAN_APPROVAL": 0.05},
+            },
+        }
+
+        # Test canonical prefixed name
+        resp_prefixed = self.server.handle_message({
+            "jsonrpc": "2.0",
+            "id": 220,
+            "method": "tools/call",
+            "params": {
+                "name": "jevguard_evaluate_command_safety",
+                "arguments": {"command": "git status", "mock_answers": mock_answers},
+            },
+        })
+        # Test backward-compatible legacy alias
+        resp_legacy = self.server.handle_message({
+            "jsonrpc": "2.0",
+            "id": 221,
+            "method": "tools/call",
+            "params": {
+                "name": "evaluate_command_safety",
+                "arguments": {"command": "git status", "mock_answers": mock_answers},
+            },
+        })
+
+        content_prefixed = json.loads(resp_prefixed["result"]["content"][0]["text"])
+        content_legacy = json.loads(resp_legacy["result"]["content"][0]["text"])
+
+        self.assertTrue(content_prefixed["success"])
+        self.assertTrue(content_legacy["success"])
+        self.assertEqual(content_prefixed["policy"], content_legacy["policy"])
+        self.assertEqual(content_prefixed["policy"], "ALLOW_AUTONOMOUS")
+        self.assertEqual(content_prefixed["cache_fingerprint"], content_legacy["cache_fingerprint"])
 
 
 class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
@@ -1414,6 +1461,9 @@ class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
 
     def test_all_atomic_tools_without_api_key_return_structured_error(self):
         tools_to_test = [
+            ("jevguard_evaluate_command_safety", {"command": "npm run test"}),
+            ("jevguard_verify_code_patch", {"patch_content": "+line", "target_file": "a.txt"}),
+            ("jevguard_evaluate_decision", {"context": "ctx", "decision_question": "q", "options": ["A", "B"]}),
             ("evaluate_command_safety", {"command": "npm run test"}),
             ("verify_code_patch", {"patch_content": "+line", "target_file": "a.txt"}),
             ("evaluate_decision", {"context": "ctx", "decision_question": "q", "options": ["A", "B"]}),

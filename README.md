@@ -30,11 +30,13 @@ A live comparison was conducted directly against the official TypeSafe AI endpoi
 
 ## Available Tools
 
+All tools are canonically registered under the `jevguard_*` prefix to guarantee 100% naming consistency and sharp disambiguation across MCP client registries. For complete backward compatibility, legacy invocations without the prefix (`evaluate_command_safety`, `verify_code_patch`, `evaluate_decision`) remain fully supported.
+
 ### Atomic Tools for Coding Agents (Cursor, Antigravity, Claude Desktop)
 
 High-level tools with atomic arguments (`str`, `bool`, `list[str]`) designed specifically for AI code agents, preventing hallucinated question schemas:
 
-#### 1. `evaluate_command_safety`
+#### 1. `jevguard_evaluate_command_safety` (alias: `evaluate_command_safety`)
 Evaluates whether a terminal/shell command is destructive, requires human approval, or can execute autonomously:
 - **Arguments**:
   - `command: str` (required): Shell command to evaluate.
@@ -43,7 +45,7 @@ Evaluates whether a terminal/shell command is destructive, requires human approv
 - **Pipeline**: Constructs a unified Noul (boundary destruction probability), Score (operational blast radius), and Choice (policy recommendation) evaluation with certainty calibration.
 - **Output**: Returns an execution policy: `ALLOW_AUTONOMOUS`, `REQUIRE_HUMAN_APPROVAL`, or `DENY_DESTRUCTIVE`.
 
-#### 2. `verify_code_patch`
+#### 2. `jevguard_verify_code_patch` (alias: `verify_code_patch`)
 Verifies unified git diffs or code patches for regressions, broken syntax, or critical system impact:
 - **Arguments**:
   - `patch_content: str` (required): Unified diff or patch text.
@@ -52,7 +54,7 @@ Verifies unified git diffs or code patches for regressions, broken syntax, or cr
 - **Pipeline**: Calibrates regression probability and risk score against the configured risk tolerance threshold.
 - **Output**: Returns `approved` (boolean), `recommendation` (`"APPROVE"`, `"REQUEST_CHANGES"`, `"REJECT"`), and `risk_level` (`"LOW"`, `"MEDIUM"`, `"HIGH"`, `"CRITICAL"`).
 
-#### 3. `evaluate_decision`
+#### 3. `jevguard_evaluate_decision` (alias: `evaluate_decision`)
 Allows coding agents to resolve architectural or technical decisions with a flat options list:
 - **Arguments**:
   - `context: str` (required): Background context and requirements.
