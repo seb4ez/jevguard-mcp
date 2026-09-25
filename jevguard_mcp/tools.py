@@ -305,6 +305,7 @@ class DeterministicCache:
         self._local = threading.local()
         self._shared_conn: Optional[sqlite3.Connection] = None
         self._open_conns: Set[sqlite3.Connection] = set()
+        self._all_conns: Set[sqlite3.Connection] = set()
 
         self.stats = {
             "hits": 0,
@@ -316,6 +317,7 @@ class DeterministicCache:
             if self.db_path == ":memory:":
                 self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=60.0)
                 self._shared_conn.row_factory = sqlite3.Row
+                self._all_conns.add(self._shared_conn)
                 try:
                     self._shared_conn.execute("PRAGMA journal_mode=WAL;")
                     self._shared_conn.execute("PRAGMA synchronous=NORMAL;")
@@ -344,6 +346,7 @@ class DeterministicCache:
             if self._shared_conn is None:
                 self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=60.0)
                 self._shared_conn.row_factory = sqlite3.Row
+                self._all_conns.add(self._shared_conn)
             try:
                 self._init_db()
             except Exception as err:
@@ -356,6 +359,7 @@ class DeterministicCache:
                 if self._shared_conn is None:
                     self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=60.0)
                     self._shared_conn.row_factory = sqlite3.Row
+                    self._all_conns.add(self._shared_conn)
                 yield self._shared_conn
             return
 
@@ -373,6 +377,7 @@ class DeterministicCache:
                 self._local.conn = conn
                 with self._lock:
                     self._open_conns.add(conn)
+                    self._all_conns.add(conn)
             except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError, PermissionError) as err:
                 logger.warning(
                     "SQLite connection error to %s (%s). Falling back to shared :memory:.",
@@ -463,7 +468,7 @@ class DeterministicCache:
         ignore_keys: Optional[Iterable[str]] = None,
         endpoint: Optional[str] = None,
         tenant_id: Optional[str] = None,
-        runtime_version: str = "1.0.2",
+        runtime_version: str = "1.1.0",
         api_key_identity: Optional[str] = None,
         **kwargs: Any,
     ) -> str:
@@ -650,15 +655,21 @@ class DeterministicCache:
             except Exception as err:
                 logger.warning("Error clearing cache database: %s", err)
 
+    def get_stats(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self.stats)
+
     def close(self) -> None:
         with self._lock:
             self._memory_lru.clear()
-            conn = getattr(self._local, "conn", None)
-            if conn is not None:
+            for conn in list(self._all_conns):
                 try:
                     conn.close()
                 except Exception:
                     pass
+            self._all_conns.clear()
+            self._open_conns.clear()
+            if hasattr(self._local, "conn"):
                 self._local.conn = None
             if self._shared_conn is not None:
                 try:
@@ -794,6 +805,18 @@ class ResponseCalibrator:
                     "question_type": q_type,
                 }
 
+            if expected_questions and name in expected_questions:
+                exp_spec = expected_questions[name]
+                if isinstance(exp_spec, dict):
+                    exp_type = str(exp_spec.get("type", "")).strip().lower()
+                    if exp_type and q_type != exp_type:
+                        item["is_ambiguous"] = True
+                        item["status"] = "AMBIGUOUS_STATE"
+                        cal_reasons = item.setdefault("calibration", {}).setdefault("reasons", [])
+                        if "question_type_mismatch" not in cal_reasons:
+                            cal_reasons.append("question_type_mismatch")
+                        cal_reasons.append(f"question_type_mismatch: expected {exp_type}, got {q_type}")
+
             if item.get("is_ambiguous", False) and name not in ambiguous_questions:
                 ambiguous_questions.append(name)
 
@@ -869,7 +892,7 @@ class ResponseCalibrator:
 
         # Check sum of probabilities
         prob_sum = sum(p for _, p in parsed_pairs)
-        if len(parsed_pairs) >= 2 and abs(prob_sum - 1.0) > 0.05:
+        if len(parsed_pairs) >= 1 and abs(prob_sum - 1.0) > 0.05:
             reasons.append("invalid_probability_sum")
 
         sorted_pairs = sorted(parsed_pairs, key=lambda x: x[1], reverse=True)
@@ -927,7 +950,7 @@ class ResponseCalibrator:
             reasons.append("low_confidence")
 
         dispersion_gap = conf
-        if isinstance(probs, dict) and len(probs) >= 2:
+        if isinstance(probs, dict) and len(probs) >= 1:
             parsed_probs: List[float] = []
             for v in probs.values():
                 try:
@@ -940,18 +963,19 @@ class ResponseCalibrator:
                 except (ValueError, TypeError):
                     if "invalid_probability" not in reasons:
                         reasons.append("invalid_probability")
-            if len(parsed_probs) >= 2:
+            if len(parsed_probs) >= 1:
                 prob_sum = sum(parsed_probs)
                 if abs(prob_sum - 1.0) > 0.05 and "invalid_probability_sum" not in reasons:
                     reasons.append("invalid_probability_sum")
-                sorted_probs = sorted(parsed_probs, reverse=True)
-                top_p = sorted_probs[0]
-                runner_p = sorted_probs[1]
-                dispersion_gap = top_p - runner_p
-                if top_p < self.min_top_prob and "low_confidence" not in reasons:
-                    reasons.append("low_confidence")
-                if dispersion_gap < self.min_dispersion_gap and "flat_distribution" not in reasons:
-                    reasons.append("flat_distribution")
+                if len(parsed_probs) >= 2:
+                    sorted_probs = sorted(parsed_probs, reverse=True)
+                    top_p = sorted_probs[0]
+                    runner_p = sorted_probs[1]
+                    dispersion_gap = top_p - runner_p
+                    if top_p < self.min_top_prob and "low_confidence" not in reasons:
+                        reasons.append("low_confidence")
+                    if dispersion_gap < self.min_dispersion_gap and "flat_distribution" not in reasons:
+                        reasons.append("flat_distribution")
 
         is_amb = len(reasons) > 0
         item["is_ambiguous"] = is_amb
@@ -1104,11 +1128,11 @@ class QuestionOptimizer:
                 else:
                     criteria[key_str] = str(v)
 
-            closed = bool(q.get("closed_world", False))
+            closed = _sanitize_bool(q.get("closed_world", False), "closed_world")
             allow_esc_opt = q.get("auto_inject_escape")
             if allow_esc_opt is None:
                 allow_esc_opt = q.get("auto_inject_escapes")
-            allow_escape = bool(allow_esc_opt) if allow_esc_opt is not None else (not closed)
+            allow_escape = _sanitize_bool(allow_esc_opt, "auto_inject_escape") if allow_esc_opt is not None else (not closed)
             wire_dict = {
                 "type": "choice",
                 "instructions": instructions,
@@ -1327,6 +1351,11 @@ class ToolRegistry:
                             "items": {"type": "string"},
                             "description": "Optional list of additional volatile state keys to mask during fingerprinting.",
                         },
+                        "collapse_whitespace": {
+                            "type": "boolean",
+                            "description": "Whether whitespace was collapsed during state pruning.",
+                            "default": True,
+                        },
                     },
                     "required": ["state"],
                 },
@@ -1357,6 +1386,16 @@ class ToolRegistry:
                             "description": "Whether the command runs with sudo or administrator privileges.",
                             "default": False,
                         },
+                        "bypass_cache": {
+                            "type": "boolean",
+                            "description": "Whether to bypass the local cache and force live evaluation.",
+                            "default": False,
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Upstream evaluation timeout in seconds (0.1 to 300.0).",
+                            "default": 10.0,
+                        },
                     },
                     "required": ["command"],
                 },
@@ -1385,6 +1424,16 @@ class ToolRegistry:
                             "enum": ["strict", "balanced", "permissive"],
                             "description": "Risk tolerance threshold for verification approval.",
                             "default": "balanced",
+                        },
+                        "bypass_cache": {
+                            "type": "boolean",
+                            "description": "Whether to bypass the local cache and force live evaluation.",
+                            "default": False,
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Upstream evaluation timeout in seconds (0.1 to 300.0).",
+                            "default": 10.0,
                         },
                     },
                     "required": ["patch_content", "target_file"],
@@ -1415,6 +1464,16 @@ class ToolRegistry:
                             "items": {"type": "string"},
                             "description": "List of mutually exclusive candidate options to select from.",
                         },
+                        "bypass_cache": {
+                            "type": "boolean",
+                            "description": "Whether to bypass the local cache and force live evaluation.",
+                            "default": False,
+                        },
+                        "timeout": {
+                            "type": "number",
+                            "description": "Upstream evaluation timeout in seconds (0.1 to 300.0).",
+                            "default": 10.0,
+                        },
                     },
                     "required": ["context", "decision_question", "options"],
                 },
@@ -1439,16 +1498,6 @@ class ToolRegistry:
         if not isinstance(arguments, dict):
             raise ValueError(f"Tool arguments must be a dictionary, got {type(arguments).__name__}")
 
-        if not self.rate_limiter.acquire():
-            return {
-                "status": "error",
-                "success": False,
-                "error_type": "RateLimitError",
-                "message": "Client rate limit exceeded (120 requests/minute).",
-                "verdict": "MANUAL_REVIEW_REQUIRED",
-                "fallback_action": "MANUAL_REVIEW_REQUIRED",
-            }
-
         handler_map = {
             "jevguard_prune_state": self._tool_prune_state,
             "jevguard_cache_fingerprint": self._tool_cache_fingerprint,
@@ -1464,6 +1513,16 @@ class ToolRegistry:
 
         if name not in handler_map:
             raise KeyError(f"Unknown tool: '{name}'")
+
+        if not self.rate_limiter.acquire():
+            return {
+                "status": "error",
+                "success": False,
+                "error_type": "RateLimitError",
+                "message": "Client rate limit exceeded (120 requests/minute).",
+                "verdict": "MANUAL_REVIEW_REQUIRED",
+                "fallback_action": "MANUAL_REVIEW_REQUIRED",
+            }
 
         allowed_keys = self.get_tool_allowed_properties(name)
         if allowed_keys is not None:
@@ -1530,26 +1589,51 @@ class ToolRegistry:
             if bf in sanitized:
                 sanitized[bf] = self._sanitize_bool(sanitized[bf], bf)
 
-        num_fields = {
-            "timeout", "min_top_prob", "min_dispersion_gap", "noul_uncertainty_margin"
-        }
-        for nf in num_fields:
-            if nf in sanitized:
-                sanitized[nf] = self._sanitize_float(sanitized[nf], nf)
+        if "timeout" in sanitized:
+            sanitized["timeout"] = self._sanitize_float(sanitized["timeout"], "timeout", min_val=0.1, max_val=300.0)
+        if "min_top_prob" in sanitized:
+            sanitized["min_top_prob"] = self._sanitize_float(sanitized["min_top_prob"], "min_top_prob", min_val=0.0, max_val=1.0)
+        if "min_dispersion_gap" in sanitized:
+            sanitized["min_dispersion_gap"] = self._sanitize_float(sanitized["min_dispersion_gap"], "min_dispersion_gap", min_val=0.0, max_val=1.0)
+        if "noul_uncertainty_margin" in sanitized:
+            sanitized["noul_uncertainty_margin"] = self._sanitize_float(sanitized["noul_uncertainty_margin"], "noul_uncertainty_margin", min_val=0.0, max_val=0.5)
+
+        if "questions" in sanitized and isinstance(sanitized["questions"], dict):
+            clean_questions = {}
+            for q_name, q_val in sanitized["questions"].items():
+                if isinstance(q_val, dict):
+                    q_copy = dict(q_val)
+                    for qb in ("closed_world", "auto_inject_escape", "auto_inject_escapes"):
+                        if qb in q_copy:
+                            q_copy[qb] = self._sanitize_bool(q_copy[qb], f"questions.{q_name}.{qb}")
+                    clean_questions[q_name] = q_copy
+                else:
+                    clean_questions[q_name] = q_val
+            sanitized["questions"] = clean_questions
 
         return sanitized
 
     _sanitize_bool = staticmethod(_sanitize_bool)
 
     @staticmethod
-    def _sanitize_float(val: Any, field_name: str) -> float:
+    def _sanitize_float(
+        val: Any,
+        field_name: str,
+        min_val: Optional[float] = None,
+        max_val: Optional[float] = None,
+    ) -> float:
         try:
             f = float(val)
             if math.isnan(f) or math.isinf(f):
                 raise ValueError()
-            return f
         except (ValueError, TypeError):
             raise ValueError(f"Invalid numeric value for argument '{field_name}': {val!r}")
+
+        if min_val is not None and f < min_val:
+            raise ValueError(f"Argument '{field_name}' must be >= {min_val}, got {f}")
+        if max_val is not None and f > max_val:
+            raise ValueError(f"Argument '{field_name}' must be <= {max_val}, got {f}")
+        return f
 
     def _tool_prune_state(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         try:
@@ -1585,6 +1669,7 @@ class ToolRegistry:
             model = str(arguments.get("model", "jev-latest")).strip() or "jev-latest"
             auto_inject = self._sanitize_bool(arguments.get("auto_inject_escapes", True), "auto_inject_escapes")
             ignore_keys = arguments.get("ignore_keys")
+            collapse_whitespace = self._sanitize_bool(arguments.get("collapse_whitespace", True), "collapse_whitespace")
 
             wire_questions = questions
             if isinstance(questions, (dict, list)) and questions:
@@ -1594,7 +1679,7 @@ class ToolRegistry:
                     wire_questions = questions
 
             # Prune state identically to evaluate so fingerprint matches live evaluation
-            pruned_state = StatePruner.prune(state, collapse_whitespace=True)
+            pruned_state = StatePruner.prune(state, collapse_whitespace=collapse_whitespace)
 
             endpoint = str(os.environ.get("TYPESAFE_ENDPOINT") or os.environ.get("JEVGUARD_ENDPOINT") or "https://api.typesafe.ai/v1/systemone").strip()
             api_key = str(os.environ.get("TYPESAFE_API_KEY", "")).strip()
@@ -1607,7 +1692,7 @@ class ToolRegistry:
                 ignore_keys=ignore_keys,
                 endpoint=endpoint,
                 tenant_id=tenant_id,
-                runtime_version="1.0.2",
+                runtime_version="1.1.0",
             )
 
             keys_used = sorted(
@@ -1643,9 +1728,9 @@ class ToolRegistry:
             if not isinstance(answers, dict):
                 raise ValueError("Argument 'answers' must be a dictionary")
 
-            min_top_prob = self._sanitize_float(arguments.get("min_top_prob", self.calibrator.min_top_prob), "min_top_prob")
-            min_dispersion = self._sanitize_float(arguments.get("min_dispersion_gap", self.calibrator.min_dispersion_gap), "min_dispersion_gap")
-            noul_margin = self._sanitize_float(arguments.get("noul_uncertainty_margin", self.calibrator.noul_margin), "noul_uncertainty_margin")
+            min_top_prob = self._sanitize_float(arguments.get("min_top_prob", self.calibrator.min_top_prob), "min_top_prob", min_val=0.0, max_val=1.0)
+            min_dispersion = self._sanitize_float(arguments.get("min_dispersion_gap", self.calibrator.min_dispersion_gap), "min_dispersion_gap", min_val=0.0, max_val=1.0)
+            noul_margin = self._sanitize_float(arguments.get("noul_uncertainty_margin", self.calibrator.noul_margin), "noul_uncertainty_margin", min_val=0.0, max_val=0.5)
 
             custom_calibrator = ResponseCalibrator(
                 min_top_prob=min_top_prob,
@@ -1658,6 +1743,7 @@ class ToolRegistry:
             return {
                 "success": True,
                 "answers": calibrated,
+                "calibrated_answers": calibrated,
                 "calibration_summary": summary,
                 "summary": summary,
                 "is_ambiguous": summary["has_ambiguity"],
@@ -1724,7 +1810,7 @@ class ToolRegistry:
                 ignore_keys=ignore_keys,
                 endpoint=endpoint,
                 tenant_id=tenant_id,
-                runtime_version="1.0.2",
+                runtime_version="1.1.0",
             )
 
             if not bypass_cache:
@@ -1732,8 +1818,10 @@ class ToolRegistry:
                 if cached_data is not None:
                     t1 = time.perf_counter()
                     latency_ms = round((t1 - t0) * 1000, 3)
+                    ans_val = cached_data["answers"]
                     return {
-                        "answers": cached_data["answers"],
+                        "answers": ans_val,
+                        "calibrated_answers": ans_val,
                         "cache_fingerprint": fingerprint,
                         "cached": True,
                         "calibration": cached_data["calibration"],
@@ -1818,6 +1906,7 @@ class ToolRegistry:
 
             return {
                 "answers": calibrated_answers,
+                "calibrated_answers": calibrated_answers,
                 "cache_fingerprint": fingerprint,
                 "cached": False,
                 "calibration": calib_summary,
@@ -1949,7 +2038,11 @@ class ToolRegistry:
             score_level: Optional[int] = None
             if raw_score is not None:
                 try:
-                    score_level = int(raw_score)
+                    parsed_score = int(raw_score)
+                    if 0 <= parsed_score <= 4:
+                        score_level = parsed_score
+                    else:
+                        score_level = 4
                 except (ValueError, TypeError):
                     score_str = str(raw_score).lower()
                     if "critical" in score_str:
@@ -1962,30 +2055,23 @@ class ToolRegistry:
                         score_level = 1
                     elif "read-only" in score_str or "harmless" in score_str:
                         score_level = 0
+                    else:
+                        score_level = 4
 
-            # Policy calculation
-            if raw_choice == "DENY_DESTRUCTIVE" or (noul_prob is not None and noul_prob >= 0.70) or score_level == 4:
-                policy = "DENY_DESTRUCTIVE"
-            elif (
-                elevated
-                or has_ambiguity
-                or noul_prob is None
-                or noul_prob >= 0.35
-                or raw_choice != "ALLOW_AUTONOMOUS"
-                or top_choice != "ALLOW_AUTONOMOUS"
-                or deny_prob >= 0.15
-                or (score_level is not None and score_level >= 2)
-            ):
-                policy = "REQUIRE_HUMAN_APPROVAL"
-            elif (
+            # Policy calculation - strict fail-closed autonomous gate
+            can_allow_autonomous = (
                 raw_choice == "ALLOW_AUTONOMOUS"
                 and top_choice == "ALLOW_AUTONOMOUS"
                 and not elevated
                 and not has_ambiguity
                 and (noul_prob is not None and noul_prob < 0.35)
-                and (score_level is None or score_level <= 1)
+                and (score_level is not None and score_level in (0, 1))
                 and deny_prob < 0.10
-            ):
+            )
+
+            if raw_choice == "DENY_DESTRUCTIVE" or (noul_prob is not None and noul_prob >= 0.70) or score_level == 4:
+                policy = "DENY_DESTRUCTIVE"
+            elif can_allow_autonomous:
                 policy = "ALLOW_AUTONOMOUS"
             else:
                 policy = "REQUIRE_HUMAN_APPROVAL"
@@ -2137,7 +2223,11 @@ class ToolRegistry:
             score_level: Optional[int] = None
             if raw_score is not None:
                 try:
-                    score_level = int(raw_score)
+                    parsed_score = int(raw_score)
+                    if 0 <= parsed_score <= 4:
+                        score_level = parsed_score
+                    else:
+                        score_level = 4
                 except (ValueError, TypeError):
                     score_str = str(raw_score).lower()
                     if "critical" in score_str:
@@ -2150,19 +2240,33 @@ class ToolRegistry:
                         score_level = 1
                     elif "clean" in score_str or "safe" in score_str:
                         score_level = 0
+                    else:
+                        score_level = 4
+
+            can_approve = (
+                not has_ambiguity
+                and noul_prob is not None
+                and raw_rec == "APPROVE"
+                and top_rec == "APPROVE"
+                and reject_prob < 0.15
+                and (score_level is not None and score_level in (0, 1))
+            )
+            if risk_tolerance == "strict" and (noul_prob is not None and noul_prob >= 0.20):
+                can_approve = False
+            elif risk_tolerance == "balanced" and (noul_prob is not None and noul_prob >= 0.40):
+                can_approve = False
+            elif risk_tolerance == "permissive" and (noul_prob is not None and noul_prob >= 0.60):
+                can_approve = False
 
             if raw_rec == "REJECT" or (noul_prob is not None and noul_prob >= 0.70) or score_level == 4:
                 rec = "REJECT"
                 approved = False
                 risk_level = "CRITICAL" if ((noul_prob and noul_prob >= 0.85) or score_level == 4) else "HIGH"
-            elif (
-                has_ambiguity
-                or noul_prob is None
-                or raw_rec != "APPROVE"
-                or top_rec != "APPROVE"
-                or reject_prob >= 0.15
-                or (score_level is not None and score_level >= 2)
-            ):
+            elif can_approve:
+                rec = "APPROVE"
+                approved = True
+                risk_level = "LOW"
+            else:
                 rec = "REQUEST_CHANGES"
                 approved = False
                 if score_level == 3 or (noul_prob and noul_prob >= 0.50):
@@ -2170,23 +2274,7 @@ class ToolRegistry:
                 elif score_level == 2 or (noul_prob and noul_prob >= 0.30):
                     risk_level = "MEDIUM"
                 else:
-                    risk_level = "LOW"
-            elif risk_tolerance == "strict" and (noul_prob is not None and noul_prob >= 0.20):
-                rec = "REQUEST_CHANGES"
-                approved = False
-                risk_level = "MEDIUM"
-            elif risk_tolerance == "balanced" and (noul_prob is not None and noul_prob >= 0.40):
-                rec = "REQUEST_CHANGES"
-                approved = False
-                risk_level = "MEDIUM"
-            elif risk_tolerance == "permissive" and (noul_prob is not None and noul_prob >= 0.60):
-                rec = "REQUEST_CHANGES"
-                approved = False
-                risk_level = "MEDIUM"
-            else:
-                rec = "APPROVE"
-                approved = True
-                risk_level = "LOW"
+                    risk_level = "MEDIUM" if score_level == 4 else "LOW"
 
             return {
                 "success": True,
@@ -2317,10 +2405,16 @@ class ToolRegistry:
             is_escape = False
             if selected_choice is not None and str(selected_choice).strip():
                 sel_clean = str(selected_choice).strip()
-                if sel_clean == ESCAPE_OPTION_KEY or sel_clean.lower() in ESCAPE_CANDIDATE_KEYS:
+                if sel_clean == ESCAPE_OPTION_KEY:
                     is_escape = True
                     selected_choice = ESCAPE_OPTION_KEY
-                elif sel_clean not in options:
+                elif sel_clean in options:
+                    is_escape = False
+                    selected_choice = sel_clean
+                elif sel_clean.lower() in ESCAPE_CANDIDATE_KEYS:
+                    is_escape = True
+                    selected_choice = ESCAPE_OPTION_KEY
+                else:
                     is_ambiguous = True
                     status = "AMBIGUOUS_STATE"
                     reasons = decision_ans.setdefault("calibration", {}).setdefault("reasons", [])
@@ -2376,24 +2470,32 @@ class ToolRegistry:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "JevGuard-MCP/1.0.2",
+            "User-Agent": "JevGuard-MCP/1.1.0",
         }
 
         MAX_RESPONSE_BYTES = 10 * 1024 * 1024
         attempts = 0
         max_attempts = max(1, max_retries + 1)
         opener = urllib.request.build_opener(NoRedirectHandler())
+        total_deadline = time.perf_counter() + timeout
 
         while attempts < max_attempts:
             attempts += 1
+            remaining_time = total_deadline - time.perf_counter()
+            if remaining_time <= 0.05:
+                raise TimeoutError(f"Total timeout of {timeout}s exceeded attempting to reach TypeSafe AI.")
+
+            attempt_timeout = min(timeout, remaining_time)
             req = urllib.request.Request(canonical_endpoint, data=raw_bytes, headers=headers, method="POST")
             t0 = time.perf_counter()
 
             try:
-                with opener.open(req, timeout=timeout) as resp:
+                with opener.open(req, timeout=attempt_timeout) as resp:
                     status_code = resp.getcode() if hasattr(resp, "getcode") else 200
                     try:
-                        body_bytes = resp.read(MAX_RESPONSE_BYTES)
+                        body_bytes = resp.read(MAX_RESPONSE_BYTES + 1)
+                        if len(body_bytes) > MAX_RESPONSE_BYTES:
+                            raise ValueError(f"Upstream response exceeded {MAX_RESPONSE_BYTES} bytes limit")
                     except TypeError:
                         body_bytes = resp.read()
                     t1 = time.perf_counter()
@@ -2410,6 +2512,9 @@ class ToolRegistry:
                         "success": True,
                     }
 
+            except RuntimeError:
+                raise
+
             except urllib.error.HTTPError as err:
                 code = err.code
                 try:
@@ -2421,15 +2526,17 @@ class ToolRegistry:
 
                 if code in (429, 500, 502, 503, 504) and attempts < max_attempts:
                     delay = initial_backoff * (2 ** (attempts - 1)) + random.uniform(0.05, 0.25)
-                    time.sleep(delay)
-                    continue
+                    if time.perf_counter() + delay < total_deadline:
+                        time.sleep(delay)
+                        continue
                 raise RuntimeError(f"HTTP {code} failure: {err_body}")
 
             except (socket.timeout, TimeoutError) as err:
                 if attempts < max_attempts:
                     delay = initial_backoff * (2 ** (attempts - 1)) + random.uniform(0.05, 0.25)
-                    time.sleep(delay)
-                    continue
+                    if time.perf_counter() + delay < total_deadline:
+                        time.sleep(delay)
+                        continue
                 raise RuntimeError(f"Connection timeout to {endpoint}: {err}")
 
             except Exception as err:
@@ -2437,8 +2544,9 @@ class ToolRegistry:
                     raise RuntimeError(f"Request error: {err}")
                 if attempts < max_attempts:
                     delay = initial_backoff * (2 ** (attempts - 1)) + random.uniform(0.05, 0.25)
-                    time.sleep(delay)
-                    continue
+                    if time.perf_counter() + delay < total_deadline:
+                        time.sleep(delay)
+                        continue
                 raise RuntimeError(f"Network error connecting to TypeSafe AI: {err}")
 
         raise RuntimeError("Failed to reach TypeSafe AI after maximum retry attempts")

@@ -64,10 +64,23 @@ class TestProtocolHandshake(unittest.TestCase):
         result = response.get("result", {})
         self.assertEqual(result.get("protocolVersion"), "2024-11-05")
         self.assertEqual(result.get("serverInfo", {}).get("name"), "jevguard-mcp")
-        self.assertEqual(result.get("serverInfo", {}).get("version"), "1.0.2")
+        self.assertEqual(result.get("serverInfo", {}).get("version"), "1.1.0")
         self.assertIn("tools", result.get("capabilities", {}))
 
     def test_notifications_initialized_produces_no_response(self):
+        # Must perform initialize handshake first per MCP lifecycle specification
+        init_req = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "1.0.0"},
+            },
+        }
+        self.server.handle_message(init_req)
+
         notification = {
             "jsonrpc": "2.0",
             "method": "notifications/initialized",
@@ -1994,10 +2007,6 @@ class TestDescriptionKeywordSeparation(unittest.TestCase):
                 )
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestAuditFindingsHardened(unittest.TestCase):
     """
     Direct regression and adversarial test suite covering all 43 forensic audit findings.
@@ -2240,3 +2249,170 @@ class TestAuditFindingsHardened(unittest.TestCase):
         cache_neg = DeterministicCache(db_path=":memory:", ttl_seconds=-100)
         self.assertEqual(cache_neg.ttl_seconds, 0.0)
         cache_nan = DeterministicCache(db_path=":memory:", ttl_seconds=float("nan"))
+        self.assertEqual(cache_nan.ttl_seconds, 3600.0)
+
+    def test_evaluate_decision_preserves_legitimate_other_option(self):
+        res = self.server.registry.execute_tool(
+            "evaluate_decision",
+            {
+                "context": "Select cloud provider",
+                "decision_question": "Which provider?",
+                "options": ["AWS", "GCP", "Other"],
+                "mock_answers": {
+                    "decision": {
+                        "type": "choice",
+                        "choice": "Other",
+                        "confidence": 0.95,
+                        "probabilities": {"AWS": 0.02, "GCP": 0.03, "Other": 0.95},
+                    }
+                },
+            },
+        )
+        self.assertTrue(res["success"])
+        self.assertEqual(res["selected_option"], "Other")
+        self.assertFalse(res["is_escape_selected"])
+        self.assertFalse(res["is_ambiguous"])
+        self.assertEqual(res["status"], "CONFIDENT")
+
+    def test_negative_or_corrupt_score_blocks_autonomous_and_approve(self):
+        # Command safety: score = -1 must NOT allow autonomous
+        res_cmd_neg = self.server.registry.execute_tool(
+            "evaluate_command_safety",
+            {
+                "command": "systemctl restart service",
+                "mock_answers": {
+                    "safety": {
+                        "type": "choice",
+                        "choice": "ALLOW_AUTONOMOUS",
+                        "confidence": 0.95,
+                        "probabilities": {"ALLOW_AUTONOMOUS": 0.95, "REQUIRE_HUMAN_APPROVAL": 0.05},
+                    },
+                    "risk_score": {"type": "score", "score": -1, "confidence": 0.9},
+                    "boundary_check": {"type": "noul", "noul": 0.1, "confidence": 0.9},
+                },
+            },
+        )
+        self.assertNotEqual(res_cmd_neg["policy"], "ALLOW_AUTONOMOUS")
+        self.assertEqual(res_cmd_neg["policy"], "DENY_DESTRUCTIVE")
+
+        # Command safety: corrupt score string must NOT allow autonomous
+        res_cmd_corrupt = self.server.registry.execute_tool(
+            "evaluate_command_safety",
+            {
+                "command": "echo test",
+                "mock_answers": {
+                    "safety": {
+                        "type": "choice",
+                        "choice": "ALLOW_AUTONOMOUS",
+                        "confidence": 0.95,
+                        "probabilities": {"ALLOW_AUTONOMOUS": 0.95, "REQUIRE_HUMAN_APPROVAL": 0.05},
+                    },
+                    "risk_score": {"type": "score", "score": "unparseable_score_blob", "confidence": 0.9},
+                    "boundary_check": {"type": "noul", "noul": 0.1, "confidence": 0.9},
+                },
+            },
+        )
+        self.assertNotEqual(res_cmd_corrupt["policy"], "ALLOW_AUTONOMOUS")
+
+        # Code patch: score = -1 must NOT approve
+        res_patch_neg = self.server.registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "diff --git a/a.py b/a.py",
+                "target_file": "a.py",
+                "mock_answers": {
+                    "recommendation": {
+                        "type": "choice",
+                        "choice": "APPROVE",
+                        "confidence": 0.95,
+                        "probabilities": {"APPROVE": 0.95, "REJECT": 0.05},
+                    },
+                    "patch_risk_score": {"type": "score", "score": -1, "confidence": 0.9},
+                    "safety_boundary": {"type": "noul", "noul": 0.1, "confidence": 0.9},
+                },
+            },
+        )
+        self.assertFalse(res_patch_neg["approved"])
+        self.assertNotEqual(res_patch_neg["recommendation"], "APPROVE")
+
+    def test_lifecycle_bypass_rejected_when_notification_sent_first(self):
+        uninit_server = MCPServer(cache_db_path=":memory:", allow_test_mocks=True, initialized=False)
+        uninit_server.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertFalse(uninit_server.initialized)
+        resp = uninit_server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}})
+        self.assertEqual(resp.get("error", {}).get("code"), -32002)
+
+    def test_float_bounds_rejection(self):
+        with self.assertRaises(ValueError):
+            self.server.registry._validate_and_sanitize_arguments(
+                "jevguard_calibrate", {"answers": {}, "min_top_prob": 1.5}
+            )
+        with self.assertRaises(ValueError):
+            self.server.registry._validate_and_sanitize_arguments(
+                "jevguard_calibrate", {"answers": {}, "min_dispersion_gap": -0.1}
+            )
+        with self.assertRaises(ValueError):
+            self.server.registry._validate_and_sanitize_arguments(
+                "jevguard_evaluate", {"state": {}, "questions": {}, "timeout": 0.0}
+            )
+        with self.assertRaises(ValueError):
+            self.server.registry._validate_and_sanitize_arguments(
+                "jevguard_evaluate", {"state": {}, "questions": {}, "timeout": 500.0}
+            )
+
+    def test_nested_boolean_sanitization(self):
+        sanitized = self.server.registry._validate_and_sanitize_arguments(
+            "jevguard_evaluate",
+            {
+                "state": {},
+                "questions": {
+                    "q1": {"type": "choice", "closed_world": "false", "auto_inject_escape": "true"}
+                },
+            },
+        )
+        q1 = sanitized["questions"]["q1"]
+        self.assertIs(q1["closed_world"], False)
+        self.assertIs(q1["auto_inject_escape"], True)
+
+    def test_cross_thread_connection_closure(self):
+        import threading
+        cache = DeterministicCache(db_path=":memory:")
+        cache.put("key1", "jev-latest", {"val": 1})
+
+        def worker():
+            cache.put("key2", "jev-latest", {"val": 2})
+            cache.get("key1")
+
+        t = threading.Thread(target=worker)
+        t.start()
+        t.join()
+
+        self.assertGreaterEqual(len(cache._all_conns), 1)
+        cache.close()
+        self.assertEqual(len(cache._all_conns), 0)
+
+    def test_expected_question_type_mismatch_detected(self):
+        calibrator = ResponseCalibrator()
+        expected = {"q1": {"type": "choice"}}
+        raw = {"q1": {"type": "score", "score": 2, "confidence": 0.9}}
+        cal, summary = calibrator.calibrate(raw, expected_questions=expected)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertIn("question_type_mismatch", summary["reasons"])
+        self.assertTrue(cal["q1"]["is_ambiguous"])
+
+    def test_single_option_invalid_probability_sum(self):
+        calibrator = ResponseCalibrator()
+        raw = {
+            "q1": {
+                "type": "choice",
+                "choice": "opt1",
+                "probabilities": {"opt1": 0.5},
+            }
+        }
+        cal, summary = calibrator.calibrate(raw)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertIn("invalid_probability_sum", summary["reasons"])
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

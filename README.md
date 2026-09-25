@@ -239,13 +239,13 @@ Run the unit tests with Python standard `unittest` runner:
 python -m unittest test_mcp_server.py -v
 ```
 
-All 112 test cases execute in under 0.6 seconds with zero network dependencies.
+All 120 test cases execute in under 0.6 seconds with zero network dependencies.
 
 ---
 
 ## Project Status and Validation Transparency
 
-JevGuard MCP is an independent open-source runtime (v1.0.2) built solely with the Python standard library.
+JevGuard MCP is an independent open-source runtime (v1.1.0) built solely with the Python standard library.
 
 Key engineering notes:
 - The local server (protocol serialization, SQLite caching, state pruning, and calibration checks) is deterministic, while upstream evaluations from TypeSafe AI / Jev are probabilistic.

@@ -14,7 +14,7 @@ from .tools import (
     get_default_cache_db_path,
 )
 
-__version__ = "1.0.2"
+__version__ = "1.1.0"
 
 __all__ = [
     "MCPServer",
