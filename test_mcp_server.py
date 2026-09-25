@@ -2599,6 +2599,16 @@ class TestAdversarialCritiqueAndHardeningFixes(unittest.TestCase):
         self.assertIn(None, cleaned["frozenset"])
         self.assertEqual(cleaned["nested"][0]["t"], (None, 3.14))
 
+        # Real JSON serialization check: ensures sets serialize to standard JSON arrays
+        dumped = json.dumps(cleaned, allow_nan=False)
+        roundtripped = json.loads(dumped)
+        self.assertEqual(roundtripped["tuple"], [1.0, None, None, None])
+        self.assertEqual(roundtripped["nested"][0]["t"], [None, 3.14])
+        self.assertIn(1.0, roundtripped["set"])
+        self.assertIn(None, roundtripped["set"])
+        self.assertIn(2.0, roundtripped["frozenset"])
+        self.assertIn(None, roundtripped["frozenset"])
+
     def test_smithery_yaml_configuration(self):
         smithery_path = pathlib.Path(repo_root) / "smithery.yaml"
         self.assertTrue(smithery_path.exists(), "smithery.yaml must exist")
@@ -2606,6 +2616,14 @@ class TestAdversarialCritiqueAndHardeningFixes(unittest.TestCase):
         self.assertIn('command: "pip install ."', content)
         self.assertIn('command: "python3"', content)
         self.assertIn("jevguard_mcp.server", content)
+
+        # Structural validation of smithery.yaml lines
+        lines = [line.strip() for line in content.splitlines() if line.strip() and not line.strip().startswith("#")]
+        self.assertTrue(any(line.startswith("build:") for line in lines))
+        self.assertTrue(any(line.startswith("startCommand:") for line in lines))
+        self.assertTrue(any("type: stdio" in line for line in lines))
+        self.assertTrue(any("configSchema:" in line for line in lines))
+        self.assertTrue(any("commandFunction:" in line for line in lines))
 
     def test_unified_defaults_and_ranges(self):
         definitions = {t["name"]: t for t in self.server.registry.get_definitions()}
@@ -2701,10 +2719,13 @@ class TestAdversarialCritiqueAndHardeningFixes(unittest.TestCase):
         # 1. ignore_keys defaults to self.cache.default_ignore_keys
         custom_cache = DeterministicCache(db_path=":memory:", default_ignore_keys=["custom_volatile_key"])
         registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=True)
+        orig_cache = registry.cache
         registry.cache = custom_cache
+        orig_cache.close()
 
         fp_tool_res = registry.execute_tool("jevguard_cache_fingerprint", {"state": {"custom_volatile_key": 1, "a": 2}})
         self.assertIn("custom_volatile_key", fp_tool_res["masked_volatile_keys"])
+        custom_cache.close()
 
         # 2. id validation in server
         # Rejected (dict/list)
@@ -2759,6 +2780,7 @@ class TestAdversarialCritiqueAndHardeningFixes(unittest.TestCase):
 
         self.assertIsNone(cache.get("corrupt1"))
         self.assertIsNone(cache.get("corrupt2"))
+        cache.close()
 
         # 5. _tool_cache_fingerprint does not silence normalize_questions exceptions
         bad_fp_res = self.server.registry.execute_tool(
@@ -2770,6 +2792,115 @@ class TestAdversarialCritiqueAndHardeningFixes(unittest.TestCase):
         )
         self.assertFalse(bad_fp_res["success"])
         self.assertEqual(bad_fp_res["error_type"], "ValueError")
+
+
+class TestAuditPointVerifications(unittest.TestCase):
+    """Forensic verification tests addressing adversarial audit observations."""
+
+    def test_id_validation_rejects_nan_inf_bool(self):
+        server = MCPServer(initialized=True)
+        # NaN and Inf must be rejected with -32600
+        for bad_id in [float("nan"), float("inf"), -float("inf")]:
+            resp = server.handle_message({"jsonrpc": "2.0", "id": bad_id, "method": "ping"})
+            self.assertEqual(resp["error"]["code"], -32600)
+            self.assertIsNone(resp["id"])
+
+        # bool (True/False) must be rejected with -32600
+        for bool_id in [True, False]:
+            resp = server.handle_message({"jsonrpc": "2.0", "id": bool_id, "method": "ping"})
+            self.assertEqual(resp["error"]["code"], -32600)
+            self.assertIsNone(resp["id"])
+
+    def test_uninitialized_notification_with_id_returns_32002(self):
+        # Server not initialized
+        server = MCPServer(initialized=False)
+        # Notification with ID before initialize must return error -32002
+        resp = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "notifications/initialized"})
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp["id"], 1)
+        self.assertEqual(resp["error"]["code"], -32002)
+        self.assertIn("Server not initialized", resp["error"]["message"])
+
+        # True notification without ID returns None (dropped per spec)
+        resp_no_id = server.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertIsNone(resp_no_id)
+
+    def test_ignore_keys_string_and_validation(self):
+        # A string "trace_id" must be converted to ["trace_id"], not character set {'t','r','a',...}
+        fp_str = DeterministicCache.compute_fingerprint(
+            model="jev-latest",
+            state={"trace_id": "123", "data": "hello", "t": "preserve_me"},
+            ignore_keys="trace_id",
+        )
+        fp_list = DeterministicCache.compute_fingerprint(
+            model="jev-latest",
+            state={"trace_id": "999", "data": "hello", "t": "preserve_me"},
+            ignore_keys=["trace_id"],
+        )
+        # Both fingerprints must match because trace_id was ignored
+        self.assertEqual(fp_str, fp_list)
+
+        # Ensure 't' was not accidentally masked
+        fp_diff = DeterministicCache.compute_fingerprint(
+            model="jev-latest",
+            state={"trace_id": "123", "data": "hello", "t": "different"},
+            ignore_keys="trace_id",
+        )
+        self.assertNotEqual(fp_str, fp_diff)
+
+        # Invalid non-iterable type raises ValidationError in execute_tool
+        registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=True)
+        res = registry.execute_tool("jevguard_cache_fingerprint", {"state": {"x": 1}, "ignore_keys": 12345})
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error_type"], "ValidationError")
+        self.assertIn("ignore_keys", res["message"])
+        registry.cache.close()
+
+    def test_corrupted_created_at_nan_purged_from_cache(self):
+        cache = DeterministicCache(db_path=":memory:")
+        with cache._get_connection() as conn:
+            conn.execute(
+                "INSERT INTO evaluation_cache (fingerprint, model, response_json, created_at, tokens_estimate) "
+                "VALUES ('nan_created_at', 'jev-latest', '{\"result\": \"data\"}', 'nan', 10)"
+            )
+            conn.commit()
+
+        # Reading the entry with NaN created_at must detect corruption, purge it, and return None
+        val = cache.get("nan_created_at")
+        self.assertIsNone(val)
+
+        # Verify row was actually deleted from database
+        with cache._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM evaluation_cache WHERE fingerprint = 'nan_created_at'")
+            count = cursor.fetchone()[0]
+            self.assertEqual(count, 0)
+        cache.close()
+
+    def test_response_calibrator_flags_choice_not_in_criteria(self):
+        calibrator = ResponseCalibrator()
+        expected_questions = {
+            "action": {
+                "type": "choice",
+                "criteria": {
+                    "approve": "Approve the action",
+                    "reject": "Reject the action",
+                },
+            }
+        }
+        # Model returns choice "other" which is NOT in criteria
+        mock_answers = {
+            "action": {
+                "type": "choice",
+                "choice": "other",
+                "confidence": 0.99,
+                "probabilities": {"other": 0.99, "approve": 0.01},
+            }
+        }
+        answers, telemetry = calibrator.calibrate(mock_answers, expected_questions=expected_questions)
+        self.assertTrue(telemetry["has_ambiguity"])
+        self.assertEqual(answers["action"]["status"], "AMBIGUOUS_STATE")
+        self.assertIn("choice_not_in_criteria", answers["action"]["calibration"]["reasons"])
 
 
 if __name__ == "__main__":

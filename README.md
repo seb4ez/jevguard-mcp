@@ -142,6 +142,7 @@ Allows coding agents to resolve architectural or technical choices with a flat o
   - `decision_question: str` (required): Core decision question.
   - `options: list[str]` (required): Candidate options (for example, `["PostgreSQL", "SQLite", "DuckDB"]`).
 - Pipeline: Injects closed-world neutral escape (`UNRESOLVED_OR_OTHER`) to catch out-of-distribution choices and calibrates probability dispersion.
+- Domain options vs epistemic escape: If a caller provides an option named `Other` (such as `["PostgreSQL", "MySQL", "Other"]`), selecting that option is treated as an intentional domain selection (`is_escape_selected: False`). In parallel, JevGuard MCP injects the canonical `UNRESOLVED_OR_OTHER` alternative to catch genuine epistemic uncertainty, out-of-distribution prompts, and ambiguous choices without conflating them with caller options.
 - Output: Returns `selected_option`, `confidence`, `is_escape_selected`, and `status` (`CONFIDENT` or `AMBIGUOUS_STATE`).
 
 ---
@@ -239,7 +240,7 @@ Run the unit tests with Python standard `unittest` runner:
 python -m unittest test_mcp_server.py -v
 ```
 
-All 129 test cases execute in under 0.6 seconds with zero network dependencies.
+All 134 test cases execute in under 0.6 seconds with zero network dependencies.
 
 ---
 

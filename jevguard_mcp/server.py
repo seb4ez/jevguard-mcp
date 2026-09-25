@@ -38,14 +38,16 @@ def _sanitize_floats(obj: Any) -> Any:
         return obj
     elif isinstance(obj, dict):
         return {k: _sanitize_floats(v) for k, v in obj.items()}
-    elif isinstance(obj, list):
-        return [_sanitize_floats(item) for item in obj]
     elif isinstance(obj, tuple):
         return tuple(_sanitize_floats(item) for item in obj)
-    elif isinstance(obj, set):
-        return {_sanitize_floats(item) for item in obj}
-    elif isinstance(obj, frozenset):
-        return frozenset(_sanitize_floats(item) for item in obj)
+    elif isinstance(obj, list):
+        return [_sanitize_floats(item) for item in obj]
+    elif isinstance(obj, (set, frozenset)):
+        items = [_sanitize_floats(item) for item in obj]
+        try:
+            return sorted(items)
+        except TypeError:
+            return sorted(items, key=lambda x: (x is not None, str(x)))
     return obj
 
 
@@ -107,13 +109,18 @@ class MCPServer:
         with self._lock:
             has_id = "id" in message
             msg_id = message.get("id")
-            if has_id and not (msg_id is None or isinstance(msg_id, (str, int, float))):
+            is_valid_id = msg_id is None or (
+                (isinstance(msg_id, str) and not isinstance(msg_id, bool))
+                or (isinstance(msg_id, int) and not isinstance(msg_id, bool))
+                or (isinstance(msg_id, float) and not math.isnan(msg_id) and not math.isinf(msg_id))
+            )
+            if has_id and not is_valid_id:
                 return {
                     "jsonrpc": "2.0",
                     "id": None,
                     "error": {
                         "code": -32600,
-                        "message": "Invalid Request: 'id' must be a string, number, or null",
+                        "message": "Invalid Request: 'id' must be a string, finite number, or null",
                     },
                 }
 
@@ -172,15 +179,25 @@ class MCPServer:
             if method in ("notifications/initialized", "initialized"):
                 if self._initialize_received:
                     self.initialized = True
+                    if has_id:
+                        return {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "result": {},
+                        }
+                    return None
                 else:
                     logger.warning("Received 'notifications/initialized' before 'initialize' request was completed.")
-                if has_id:
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": msg_id,
-                        "result": {},
-                    }
-                return None
+                    if has_id:
+                        return {
+                            "jsonrpc": "2.0",
+                            "id": msg_id,
+                            "error": {
+                                "code": -32002,
+                                "message": "Server not initialized: must call 'initialize' before 'notifications/initialized'",
+                            },
+                        }
+                    return None
 
             if method in ("notifications/cancelled", "cancelled"):
                 if has_id:
@@ -421,7 +438,7 @@ class MCPServer:
 
                 MAX_LINE_BYTES = 10 * 1024 * 1024
                 try:
-                    line = input_stream.readline(MAX_LINE_BYTES + 1)
+                    line = input_stream.readline(MAX_LINE_BYTES + 4096)
                 except (EOFError, KeyboardInterrupt):
                     break
                 except (BrokenPipeError, ConnectionResetError):
@@ -433,10 +450,13 @@ class MCPServer:
                 if not line:
                     break
 
-                if len(line) > MAX_LINE_BYTES:
+                content_to_check = line.rstrip("\r\n")
+                byte_len = len(content_to_check.encode("utf-8"))
+
+                if byte_len > MAX_LINE_BYTES:
                     if not line.endswith("\n"):
                         while True:
-                            chunk = input_stream.readline(MAX_LINE_BYTES)
+                            chunk = input_stream.readline(65536)
                             if not chunk or chunk.endswith("\n"):
                                 break
                     err_resp = {

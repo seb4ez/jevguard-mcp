@@ -493,6 +493,9 @@ class DeterministicCache:
         target_state = state if state is not None else {}
         target_questions = wire_questions if wire_questions is not None else {}
 
+        if isinstance(ignore_keys, str):
+            ignore_keys = [ignore_keys]
+
         keys_to_ignore = (
             set(DEFAULT_VOLATILE_KEYS).union({str(k).strip().lower().replace("-", "_") for k in ignore_keys})
             if ignore_keys is not None
@@ -550,6 +553,8 @@ class DeterministicCache:
                     raw_created_at = row["created_at"]
                     try:
                         entry_created_at = float(raw_created_at)
+                        if math.isnan(entry_created_at) or math.isinf(entry_created_at):
+                            raise ValueError("Invalid created_at timestamp in cache row")
                     except (ValueError, TypeError):
                         conn.execute("DELETE FROM evaluation_cache WHERE fingerprint = ?", (fingerprint,))
                         conn.commit()
@@ -574,6 +579,8 @@ class DeterministicCache:
                         raw_tokens = row["tokens_estimate"]
                         try:
                             tokens = int(raw_tokens)
+                            if tokens < 0:
+                                tokens = 0
                         except (ValueError, TypeError):
                             tokens = 0
 
@@ -847,6 +854,27 @@ class ResponseCalibrator:
                         if "question_type_mismatch" not in cal_reasons:
                             cal_reasons.append("question_type_mismatch")
                         cal_reasons.append(f"question_type_mismatch: expected {exp_type}, got {q_type}")
+
+                    if q_type == "choice":
+                        raw_choice = item.get("choice")
+                        crit = exp_spec.get("criteria")
+                        valid_choices = set()
+                        if isinstance(crit, dict):
+                            valid_choices = set(crit.keys())
+                        elif isinstance(crit, (list, tuple)):
+                            valid_choices = set(str(c) for c in crit)
+                        elif isinstance(exp_spec.get("options"), (list, tuple)):
+                            valid_choices = set(str(o) for o in exp_spec["options"])
+
+                        if valid_choices and raw_choice is not None:
+                            choice_str = str(raw_choice).strip()
+                            if choice_str not in valid_choices and choice_str.lower() not in {v.lower() for v in valid_choices}:
+                                item["is_ambiguous"] = True
+                                item["status"] = "AMBIGUOUS_STATE"
+                                cal_reasons = item.setdefault("calibration", {}).setdefault("reasons", [])
+                                if "choice_not_in_criteria" not in cal_reasons:
+                                    cal_reasons.append("choice_not_in_criteria")
+                                cal_reasons.append(f"choice_not_in_criteria: '{raw_choice}' not in {sorted(list(valid_choices))}")
 
             if item.get("is_ambiguous", False) and name not in ambiguous_questions:
                 ambiguous_questions.append(name)
@@ -1608,6 +1636,16 @@ class ToolRegistry:
         try:
             # Execute handler without holding registry lock, preventing network deadlocks
             return handler(sanitized_args)
+        except (ValueError, TypeError) as val_err:
+            logger.warning("Validation or value error in tool '%s': %s", name, val_err)
+            return {
+                "status": "error",
+                "success": False,
+                "error_type": "ValidationError",
+                "message": str(val_err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
+                "fallback_action": "MANUAL_REVIEW_REQUIRED",
+            }
         except Exception as err:
             logger.warning("Tool execution error in '%s': %s", name, err)
             return {
@@ -1621,6 +1659,16 @@ class ToolRegistry:
 
     def _validate_and_sanitize_arguments(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
         sanitized = dict(arguments)
+
+        if "ignore_keys" in sanitized:
+            ik = sanitized["ignore_keys"]
+            if ik is not None:
+                if isinstance(ik, str):
+                    sanitized["ignore_keys"] = [ik.strip()]
+                elif isinstance(ik, (list, tuple, set)):
+                    sanitized["ignore_keys"] = [str(k).strip() for k in ik]
+                else:
+                    raise ValueError("Argument 'ignore_keys' must be an array of string keys")
 
         bool_fields = {
             "prune_lists", "auto_inject_escapes", "bypass_cache",
