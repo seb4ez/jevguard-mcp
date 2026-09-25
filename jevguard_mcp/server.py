@@ -7,6 +7,8 @@ Uses strictly the Python standard library with zero external dependencies.
 import io
 import json
 import logging
+import math
+import os
 import sys
 import threading
 from typing import Any, Dict, Optional, TextIO
@@ -28,6 +30,19 @@ SERVER_NAME: str = "jevguard-mcp"
 SERVER_VERSION: str = "1.0.2"
 
 
+def _sanitize_floats(obj: Any) -> Any:
+    """Recursively replaces NaN and Infinity with None to guarantee standard JSON compliance."""
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    elif isinstance(obj, dict):
+        return {k: _sanitize_floats(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_sanitize_floats(item) for item in obj]
+    return obj
+
+
 class MCPServer:
     """Standard JSON-RPC 2.0 stdio server implementing the Model Context Protocol."""
 
@@ -36,14 +51,18 @@ class MCPServer:
         name: str = SERVER_NAME,
         version: str = SERVER_VERSION,
         cache_db_path: Optional[str] = None,
-        allow_test_mocks: bool = False,
+        allow_test_mocks: Optional[bool] = None,
+        initialized: bool = False,
     ):
         self.name = name
         self.version = version
         self.protocol_version = PROTOCOL_VERSION
         self._lock = threading.RLock()
-        self.registry = ToolRegistry(cache_db_path=cache_db_path, allow_test_mocks=allow_test_mocks)
-        self.initialized = False
+        effective_cache_path = cache_db_path
+        if effective_cache_path is None and os.environ.get("JEVGUARD_TEST_MODE") == "1":
+            effective_cache_path = ":memory:"
+        self.registry = ToolRegistry(cache_db_path=effective_cache_path, allow_test_mocks=allow_test_mocks)
+        self.initialized = initialized
         self.running = False
 
     def handle_line(self, line: str) -> Optional[Dict[str, Any]]:
@@ -54,7 +73,7 @@ class MCPServer:
 
         try:
             payload = json.loads(stripped)
-        except json.JSONDecodeError as err:
+        except (json.JSONDecodeError, RecursionError, Exception) as err:
             return {
                 "jsonrpc": "2.0",
                 "id": None,
@@ -90,8 +109,9 @@ class MCPServer:
                 }
 
             method = message.get("method")
+            has_id = "id" in message
             msg_id = message.get("id")
-            is_notification = "id" not in message or msg_id is None
+            is_notification = not has_id
 
             if not isinstance(method, str):
                 if is_notification:
@@ -105,10 +125,10 @@ class MCPServer:
                     },
                 }
 
-            params = message.get("params", {})
+            params = message.get("params")
             if params is None:
                 params = {}
-            elif not isinstance(params, (dict, list)):
+            elif isinstance(params, list):
                 if is_notification:
                     return None
                 return {
@@ -116,7 +136,18 @@ class MCPServer:
                     "id": msg_id,
                     "error": {
                         "code": -32602,
-                        "message": "Invalid params: params must be an object or array",
+                        "message": "Invalid params: params must be a JSON object, arrays are unsupported",
+                    },
+                }
+            elif not isinstance(params, dict):
+                if is_notification:
+                    return None
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Invalid params: params must be an object",
                     },
                 }
 
@@ -136,7 +167,18 @@ class MCPServer:
                 return self._handle_initialize(msg_id, params)
             elif method == "ping":
                 return self._handle_ping(msg_id)
-            elif method == "tools/list":
+
+            if not self.initialized:
+                return {
+                    "jsonrpc": "2.0",
+                    "id": msg_id,
+                    "error": {
+                        "code": -32002,
+                        "message": f"Server not initialized: must call 'initialize' before '{method}'",
+                    },
+                }
+
+            if method == "tools/list":
                 return self._handle_tools_list(msg_id)
             elif method == "tools/call":
                 return self._handle_tools_call(msg_id, params)
@@ -151,6 +193,37 @@ class MCPServer:
                 }
 
     def _handle_initialize(self, msg_id: Any, params: Any) -> Dict[str, Any]:
+        if not isinstance(params, dict):
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: initialize parameters must be a JSON object",
+                },
+            }
+        protocol_version = params.get("protocolVersion")
+        if not protocol_version or not isinstance(protocol_version, str):
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'protocolVersion' string is required for initialize",
+                },
+            }
+        client_info = params.get("clientInfo")
+        if not isinstance(client_info, dict) or not str(client_info.get("name", "")).strip():
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid params: 'clientInfo' object with non-empty 'name' is required for initialize",
+                },
+            }
+
+        self.initialized = True
         return {
             "jsonrpc": "2.0",
             "id": msg_id,
@@ -241,14 +314,18 @@ class MCPServer:
             return {
                 "jsonrpc": "2.0",
                 "id": msg_id,
-                "result": {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": f"Error: Tool '{name}' not found. {err}",
-                        }
-                    ],
-                    "isError": True,
+                "error": {
+                    "code": -32601,
+                    "message": f"Method not found / Unknown tool: '{name}' ({err})",
+                },
+            }
+        except (ValueError, TypeError) as err:
+            return {
+                "jsonrpc": "2.0",
+                "id": msg_id,
+                "error": {
+                    "code": -32602,
+                    "message": f"Invalid params: {err}",
                 },
             }
         except Exception as err:
@@ -325,10 +402,12 @@ class MCPServer:
                 response = self.handle_line(line)
                 if response is not None:
                     try:
+                        clean_response = _sanitize_floats(response)
                         serialized = json.dumps(
-                            response,
+                            clean_response,
                             separators=(",", ":"),
                             ensure_ascii=False,
+                            allow_nan=False,
                             default=str,
                         )
                         with self._lock:

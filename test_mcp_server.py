@@ -21,6 +21,7 @@ from unittest import mock
 
 # Enable test mode for test suite execution to permit test mock answers
 os.environ["JEVGUARD_TEST_MODE"] = "1"
+os.environ.pop("TYPESAFE_API_KEY", None)
 
 repo_root = str(pathlib.Path(__file__).resolve().parent)
 if repo_root not in sys.path:
@@ -42,7 +43,7 @@ class TestProtocolHandshake(unittest.TestCase):
     """Verifies MCP JSON-RPC 2.0 handshake and basic protocol operations."""
 
     def setUp(self):
-        self.server = MCPServer()
+        self.server = MCPServer(cache_db_path=":memory:")
 
     def test_initialize_request(self):
         request = {
@@ -94,6 +95,7 @@ class TestProtocolHandshake(unittest.TestCase):
         self.assertEqual(response.get("result"), {})
 
     def test_unknown_method_returns_error(self):
+        self.server.initialized = True
         request = {
             "jsonrpc": "2.0",
             "id": 99,
@@ -104,6 +106,27 @@ class TestProtocolHandshake(unittest.TestCase):
         self.assertEqual(response.get("id"), 99)
         self.assertIn("error", response)
         self.assertEqual(response["error"]["code"], -32601)
+
+    def test_uninitialized_request_returns_error_32002(self):
+        server = MCPServer(cache_db_path=":memory:")
+        request = {
+            "jsonrpc": "2.0",
+            "id": 100,
+            "method": "tools/list",
+        }
+        response = server.handle_message(request)
+        self.assertIsNotNone(response)
+        self.assertEqual(response.get("id"), 100)
+        self.assertIn("error", response)
+        self.assertEqual(response["error"]["code"], -32002)
+
+    def test_initialize_validation_missing_params(self):
+        server = MCPServer(cache_db_path=":memory:")
+        # Missing required protocolVersion and clientInfo
+        req = {"jsonrpc": "2.0", "id": 101, "method": "initialize", "params": {}}
+        resp = server.handle_message(req)
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp["error"]["code"], -32602)
 
     def test_parse_error_on_malformed_json_string(self):
         raw_line = "{malformed json input"
@@ -123,7 +146,7 @@ class TestToolsList(unittest.TestCase):
     """Verifies tool discovery and schema correctness."""
 
     def setUp(self):
-        self.server = MCPServer()
+        self.server = MCPServer(cache_db_path=":memory:", initialized=True)
 
     def test_tools_list_returns_seven_canonical_tools(self):
         request = {
@@ -364,7 +387,7 @@ class TestToolsCallExecution(unittest.TestCase):
     """Verifies end-to-end tool calls via JSON-RPC tools/call."""
 
     def setUp(self):
-        self.server = MCPServer()
+        self.server = MCPServer(cache_db_path=":memory:", initialized=True)
         self.server.registry.cache.clear()
 
     def tearDown(self):
@@ -503,8 +526,9 @@ class TestToolsCallExecution(unittest.TestCase):
         }
         resp = self.server.handle_message(call_msg)
         self.assertIsNotNone(resp)
-        self.assertTrue(resp.get("result", {}).get("isError"))
-        self.assertIn("not found", resp["result"]["content"][0]["text"].lower())
+        self.assertIn("error", resp)
+        self.assertEqual(resp["error"]["code"], -32601)
+        self.assertIn("unknown tool", resp["error"]["message"].lower())
 
 
 class TestServerStdioPipeline(unittest.TestCase):
@@ -512,7 +536,16 @@ class TestServerStdioPipeline(unittest.TestCase):
 
     def test_complete_stdio_stream(self):
         requests = [
-            {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}},
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "stdio-client", "version": "1.0.0"},
+                },
+            },
             {"jsonrpc": "2.0", "method": "notifications/initialized"},
             {"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}},
             {
@@ -531,7 +564,7 @@ class TestServerStdioPipeline(unittest.TestCase):
         input_stream = io.StringIO(raw_input)
         output_stream = io.StringIO()
 
-        server = MCPServer()
+        server = MCPServer(cache_db_path=":memory:")
         server.run_stdio(input_stream=input_stream, output_stream=output_stream)
 
         output_lines = [
@@ -686,8 +719,9 @@ class TestQuestionOptimizerEdgeCases(unittest.TestCase):
                 "criteria": None,
             }
         }
-        wire_questions, _ = self.optimizer.normalize_questions(questions)
-        self.assertEqual(wire_questions["q_score"]["criteria"], [])
+        with self.assertRaises(ValueError) as ctx:
+            self.optimizer.normalize_questions(questions)
+        self.assertIn("at least one rubric criterion", str(ctx.exception).lower())
 
     def test_auto_inject_escape_override(self):
         questions = {
@@ -753,14 +787,21 @@ class TestAuditPoint2MissingEnvVariables(unittest.TestCase):
     def setUp(self):
         self.env_patcher = mock.patch.dict(os.environ, {}, clear=True)
         self.env_patcher.start()
-        self.server = MCPServer(cache_db_path=":memory:", allow_test_mocks=True)
+        self.server = MCPServer(cache_db_path=":memory:", allow_test_mocks=True, initialized=True)
 
     def tearDown(self):
         self.env_patcher.stop()
 
     def test_handshake_and_listing_without_api_key(self):
         resp_init = self.server.handle_message({
-            "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "test-env", "version": "1.0.0"},
+            },
         })
         self.assertEqual(resp_init["result"]["serverInfo"]["name"], "jevguard-mcp")
 
@@ -916,7 +957,7 @@ class TestAuditPoint4JSONSerializationSafety(unittest.TestCase):
         json.dumps(res3)
 
     def test_server_serializes_non_serializable_objects_via_default_str(self):
-        server = MCPServer(cache_db_path=":memory:")
+        server = MCPServer(cache_db_path=":memory:", initialized=True)
         class NonSerializableObject:
             def __str__(self):
                 return "<NonSerializableObjectInstance>"
@@ -997,7 +1038,7 @@ class TestAtomicToolsProtocol(unittest.TestCase):
     """Verifies the 3 high-level atomic tools through the MCP JSON-RPC protocol."""
 
     def setUp(self):
-        self.server = MCPServer(cache_db_path=":memory:")
+        self.server = MCPServer(cache_db_path=":memory:", allow_test_mocks=True, initialized=True)
 
     def test_call_evaluate_command_safety_allow_autonomous(self):
         mock_answers = {
@@ -1008,6 +1049,7 @@ class TestAtomicToolsProtocol(unittest.TestCase):
             },
             "risk_score": {
                 "type": "score",
+                "score": 1,
                 "confidence": 0.90,
             },
             "execution_policy": {
@@ -1166,6 +1208,7 @@ class TestAtomicToolsProtocol(unittest.TestCase):
             },
             "risk_score": {
                 "type": "score",
+                "score": 1,
                 "confidence": 0.95,
             },
             "recommendation": {
@@ -1400,7 +1443,7 @@ class TestAtomicToolsProtocol(unittest.TestCase):
     def test_prefixed_and_legacy_tool_invocations_produce_identical_results(self):
         mock_answers = {
             "is_destructive": {"type": "noul", "noul": 0.02, "confidence": 0.98},
-            "risk_score": {"type": "score", "confidence": 0.95},
+            "risk_score": {"type": "score", "score": 1, "confidence": 0.95},
             "execution_policy": {
                 "type": "choice",
                 "choice": "ALLOW_AUTONOMOUS",
@@ -1444,7 +1487,7 @@ class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
     """Verifies that failures never disconnect the MCP JSON-RPC protocol."""
 
     def setUp(self):
-        self.server = MCPServer(cache_db_path=":memory:")
+        self.server = MCPServer(cache_db_path=":memory:", allow_test_mocks=True, initialized=True)
 
     def test_simulated_tool_exception_returns_structured_json(self):
         with mock.patch.object(self.server.registry, "_tool_evaluate", side_effect=RuntimeError("Simulated upstream gateway timeout")):
@@ -1470,7 +1513,8 @@ class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
             self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
 
     def test_all_atomic_tools_without_api_key_return_structured_error(self):
-        tools_to_test = [
+        with mock.patch.dict(os.environ, {}, clear=True):
+            tools_to_test = [
             ("jevguard_evaluate_command_safety", {"command": "npm run test"}),
             ("jevguard_verify_code_patch", {"patch_content": "+line", "target_file": "a.txt"}),
             ("jevguard_evaluate_decision", {"context": "ctx", "decision_question": "q", "options": ["A", "B"]}),
@@ -1479,23 +1523,23 @@ class TestStructuredErrorHandlingAndProtocolStability(unittest.TestCase):
             ("evaluate_decision", {"context": "ctx", "decision_question": "q", "options": ["A", "B"]}),
         ]
 
-        for tool_name, args in tools_to_test:
-            with self.subTest(tool=tool_name):
-                call_msg = {
-                    "jsonrpc": "2.0",
-                    "id": 302,
-                    "method": "tools/call",
-                    "params": {"name": tool_name, "arguments": args},
-                }
-                resp = self.server.handle_message(call_msg)
-                self.assertIsNotNone(resp)
-                self.assertTrue(resp.get("result", {}).get("isError", False))
-                content = json.loads(resp["result"]["content"][0]["text"])
-                self.assertFalse(content["success"])
-                self.assertEqual(content["status"], "error")
-                self.assertEqual(content["error_type"], "ConfigurationError")
-                self.assertEqual(content["verdict"], "MANUAL_REVIEW_REQUIRED")
-                self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+            for tool_name, args in tools_to_test:
+                with self.subTest(tool=tool_name):
+                    call_msg = {
+                        "jsonrpc": "2.0",
+                        "id": 302,
+                        "method": "tools/call",
+                        "params": {"name": tool_name, "arguments": args},
+                    }
+                    resp = self.server.handle_message(call_msg)
+                    self.assertIsNotNone(resp)
+                    self.assertTrue(resp.get("result", {}).get("isError", False))
+                    content = json.loads(resp["result"]["content"][0]["text"])
+                    self.assertFalse(content["success"])
+                    self.assertEqual(content["status"], "error")
+                    self.assertEqual(content["error_type"], "ConfigurationError")
+                    self.assertEqual(content["verdict"], "MANUAL_REVIEW_REQUIRED")
+                    self.assertEqual(content["fallback_action"], "MANUAL_REVIEW_REQUIRED")
 
 
 class TestHardenedSQLiteConcurrency(unittest.TestCase):
@@ -1865,7 +1909,7 @@ class TestDescriptionKeywordSeparation(unittest.TestCase):
     """
 
     def setUp(self):
-        self.server = MCPServer(cache_db_path=":memory:")
+        self.server = MCPServer(cache_db_path=":memory:", initialized=True)
         tools_resp = self.server.handle_message({
             "jsonrpc": "2.0",
             "id": 1,
@@ -1952,3 +1996,247 @@ class TestDescriptionKeywordSeparation(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestAuditFindingsHardened(unittest.TestCase):
+    """
+    Direct regression and adversarial test suite covering all 43 forensic audit findings.
+    Ensures zero shortcuts, no happy-path mocks masking real issues, and rigorous edge cases.
+    """
+
+    def setUp(self):
+        self.server = MCPServer(cache_db_path=":memory:", allow_test_mocks=True, initialized=True)
+
+    def test_finding_1_empty_or_incomplete_upstream_answers_fail_closed(self):
+        calibrator = ResponseCalibrator()
+        expected = {"q1": {"type": "choice", "criteria": {"a": "A", "b": "B"}}, "q2": {"type": "noul"}}
+        
+        # Missing q2 entirely
+        raw_incomplete = {"q1": {"type": "choice", "choice": "a", "confidence": 0.95, "probabilities": {"a": 0.95, "b": 0.05}}}
+        calibrated, summary = calibrator.calibrate(raw_incomplete, expected_questions=expected)
+        self.assertTrue(summary["has_ambiguity"])
+        self.assertEqual(summary["verdict"], "AMBIGUOUS_STATE")
+        self.assertIn("missing_answer: q2", summary["reasons"])
+
+        # Empty answers dict
+        calibrated_empty, summary_empty = calibrator.calibrate({}, expected_questions=expected)
+        self.assertTrue(summary_empty["has_ambiguity"])
+        self.assertEqual(summary_empty["verdict"], "AMBIGUOUS_STATE")
+        self.assertIn("empty_answers_payload", summary_empty["reasons"])
+
+    def test_finding_2_probability_validation_and_noul_range(self):
+        calibrator = ResponseCalibrator()
+        
+        # Probability > 1.0
+        q_high = {"q": {"type": "choice", "choice": "a", "confidence": 1.5, "probabilities": {"a": 1.5, "b": 0.1}}}
+        cal, sum_res = calibrator.calibrate(q_high)
+        self.assertTrue(cal["q"]["is_ambiguous"])
+        self.assertIn("invalid_probability", cal["q"]["calibration"]["reasons"])
+
+        # Probability < 0.0
+        q_neg = {"q": {"type": "choice", "choice": "a", "confidence": 0.9, "probabilities": {"a": 1.1, "b": -0.1}}}
+        cal, sum_res = calibrator.calibrate(q_neg)
+        self.assertTrue(cal["q"]["is_ambiguous"])
+        self.assertIn("invalid_probability", cal["q"]["calibration"]["reasons"])
+
+        # noul > 1.0
+        q_noul_high = {"q": {"type": "noul", "noul": 1.25, "confidence": 0.9}}
+        cal, sum_res = calibrator.calibrate(q_noul_high)
+        self.assertTrue(cal["q"]["is_ambiguous"])
+        self.assertIn("invalid_noul_range", cal["q"]["calibration"]["reasons"])
+
+    def test_finding_3_choice_probability_mismatch_blocks_autonomous(self):
+        res = self.server.registry.execute_tool(
+            "evaluate_command_safety",
+            {
+                "command": "git push --force origin main",
+                "mock_answers": {
+                    "is_destructive": {"type": "noul", "noul": 0.1, "confidence": 0.9},
+                    "risk_score": {"type": "score", "score": 1, "confidence": 0.9},
+                    "execution_policy": {
+                        "type": "choice",
+                        "choice": "ALLOW_AUTONOMOUS",
+                        "confidence": 0.90,
+                        "probabilities": {
+                            "DENY_DESTRUCTIVE": 0.90,
+                            "ALLOW_AUTONOMOUS": 0.10,
+                        },
+                    },
+                },
+            },
+        )
+        self.assertTrue(res["success"])
+        self.assertNotEqual(res["policy"], "ALLOW_AUTONOMOUS")
+        self.assertTrue(res["verdict"]["requires_human"])
+        self.assertIn(res["policy"], ("DENY_DESTRUCTIVE", "REQUIRE_HUMAN_APPROVAL"))
+
+    def test_finding_4_command_safety_risk_score_blocks_autonomous(self):
+        res = self.server.registry.execute_tool(
+            "evaluate_command_safety",
+            {
+                "command": "rm -rf build/",
+                "mock_answers": {
+                    "is_destructive": {"type": "noul", "noul": 0.05, "confidence": 0.95},
+                    "risk_score": {"type": "score", "score": 3, "confidence": 0.95},
+                    "execution_policy": {
+                        "type": "choice",
+                        "choice": "ALLOW_AUTONOMOUS",
+                        "confidence": 0.95,
+                        "probabilities": {"ALLOW_AUTONOMOUS": 0.95, "DENY_DESTRUCTIVE": 0.05},
+                    },
+                },
+            },
+        )
+        self.assertTrue(res["success"])
+        self.assertNotEqual(res["policy"], "ALLOW_AUTONOMOUS")
+        self.assertTrue(res["verdict"]["requires_human"])
+
+    def test_finding_5_verify_code_patch_risk_score_blocks_approval(self):
+        res = self.server.registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "+def run(): eval(user_input)",
+                "target_file": "server.py",
+                "risk_tolerance": "strict",
+                "mock_answers": {
+                    "has_regression": {"type": "noul", "noul": 0.05, "confidence": 0.95},
+                    "risk_score": {"type": "score", "score": 3, "confidence": 0.95},
+                    "recommendation": {
+                        "type": "choice",
+                        "choice": "APPROVE",
+                        "confidence": 0.95,
+                        "probabilities": {"APPROVE": 0.95, "REJECT": 0.05},
+                    },
+                },
+            },
+        )
+        self.assertTrue(res["success"])
+        self.assertFalse(res["approved"])
+        self.assertNotEqual(res["recommendation"], "APPROVE")
+
+    def test_finding_6_evaluate_decision_nonexistent_option_fails_closed(self):
+        res = self.server.registry.execute_tool(
+            "evaluate_decision",
+            {
+                "context": "Selecting database backend",
+                "decision_question": "Which database?",
+                "options": ["PostgreSQL", "SQLite"],
+                "mock_answers": {
+                    "decision": {
+                        "type": "choice",
+                        "choice": "MongoDB",
+                        "confidence": 0.95,
+                        "probabilities": {"MongoDB": 0.95, "PostgreSQL": 0.05},
+                    }
+                },
+            },
+        )
+        self.assertTrue(res["is_ambiguous"])
+        self.assertEqual(res["status"], "AMBIGUOUS_STATE")
+
+    def test_finding_7_test_mode_cannot_bypass_explicit_allow_test_mocks_false(self):
+        with mock.patch.dict(os.environ, {"JEVGUARD_TEST_MODE": "1"}):
+            registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=False)
+            res = registry.execute_tool(
+                "jevguard_evaluate",
+                {
+                    "state": {"k": "v"},
+                    "questions": {"q": {"type": "choice", "options": ["a", "b"]}},
+                    "mock_answers": {"q": {"type": "choice", "choice": "a"}},
+                },
+            )
+            self.assertFalse(res["success"])
+            self.assertEqual(res["error_type"], "SecurityError")
+
+    def test_finding_8_cache_fingerprint_includes_endpoint_and_identity(self):
+        fp1 = DeterministicCache.compute_fingerprint(
+            model="jev-latest",
+            state={"k": "v"},
+            endpoint="https://api.typesafe.ai/v1/systemone",
+            api_key_identity="key_tenant_alpha",
+        )
+        fp2 = DeterministicCache.compute_fingerprint(
+            model="jev-latest",
+            state={"k": "v"},
+            endpoint="https://api.typesafe.ai/v1/systemone",
+            api_key_identity="key_tenant_beta",
+        )
+        fp3 = DeterministicCache.compute_fingerprint(
+            model="jev-latest",
+            state={"k": "v"},
+            endpoint="https://staging.typesafe.ai/v1/systemone",
+            api_key_identity="key_tenant_alpha",
+        )
+        self.assertNotEqual(fp1, fp2)
+        self.assertNotEqual(fp1, fp3)
+
+    def test_finding_9_sanitize_bool_robustness(self):
+        from jevguard_mcp.tools import _sanitize_bool
+        self.assertFalse(_sanitize_bool("false"))
+        self.assertFalse(_sanitize_bool("False"))
+        self.assertFalse(_sanitize_bool("0"))
+        self.assertFalse(_sanitize_bool(False))
+        self.assertTrue(_sanitize_bool("true"))
+        self.assertTrue(_sanitize_bool("True"))
+        self.assertTrue(_sanitize_bool("1"))
+        self.assertTrue(_sanitize_bool(True))
+        with self.assertRaises(ValueError):
+            _sanitize_bool("not_a_boolean")
+
+    def test_finding_11_recursion_depth_returns_parse_error(self):
+        deep_json = "[" * 5000 + "]" * 5000
+        resp = self.server.handle_line(deep_json)
+        self.assertIsNotNone(resp)
+        self.assertEqual(resp.get("error", {}).get("code"), -32700)
+
+    def test_finding_14_nan_infinity_sanitization(self):
+        from jevguard_mcp.server import _sanitize_floats
+        sanitized = _sanitize_floats({"nan_val": float("nan"), "inf_val": float("inf"), "valid": 1.23})
+        self.assertIsNone(sanitized["nan_val"])
+        self.assertIsNone(sanitized["inf_val"])
+        self.assertEqual(sanitized["valid"], 1.23)
+
+    def test_finding_17_duplicate_question_names_in_list_rejected(self):
+        opt = QuestionOptimizer()
+        questions = [
+            {"name": "check_auth", "type": "noul", "instructions": "Check auth"},
+            {"name": "check_auth", "type": "choice", "options": ["a", "b"]},
+        ]
+        with self.assertRaises(ValueError) as ctx:
+            opt.normalize_questions(questions)
+        self.assertIn("duplicate question name", str(ctx.exception).lower())
+
+    def test_finding_18_optimizer_auto_inject_escapes_setting_respected(self):
+        opt = QuestionOptimizer(auto_inject_escapes=False)
+        questions = {"q1": {"type": "choice", "options": ["opt1", "opt2"]}}
+        wire, injected = opt.normalize_questions(questions)
+        self.assertNotIn("q1", injected)
+        self.assertNotIn(ESCAPE_OPTION_KEY, wire["q1"]["criteria"])
+
+    def test_finding_19_escape_aliases_handled_consistently(self):
+        from jevguard_mcp.tools import is_escape_selected
+        self.assertTrue(is_escape_selected(ESCAPE_OPTION_KEY))
+        self.assertTrue(is_escape_selected("other"))
+        self.assertTrue(is_escape_selected("unresolved"))
+        self.assertFalse(is_escape_selected("PostgreSQL"))
+
+    def test_finding_20_rate_limiter_restricts_excessive_calls(self):
+        from jevguard_mcp.tools import RateLimiter
+        limiter = RateLimiter(max_per_minute=5)
+        for _ in range(5):
+            self.assertTrue(limiter.acquire("client1"))
+        self.assertFalse(limiter.acquire("client1"))
+
+    def test_low_1_max_memory_items_zero_or_negative(self):
+        cache = DeterministicCache(db_path=":memory:", max_memory_items=0)
+        cache.put("fp_item", "jev-latest", {"status": "ok"})
+        val = cache.get("fp_item")
+        self.assertEqual(val, {"status": "ok"})
+        cache.close()
+
+    def test_medium_8_invalid_ttl_values_handled_safely(self):
+        cache_zero = DeterministicCache(db_path=":memory:", ttl_seconds=0)
+        self.assertEqual(cache_zero.ttl_seconds, 0.0)
+        cache_neg = DeterministicCache(db_path=":memory:", ttl_seconds=-100)
+        self.assertEqual(cache_neg.ttl_seconds, 0.0)
+        cache_nan = DeterministicCache(db_path=":memory:", ttl_seconds=float("nan"))

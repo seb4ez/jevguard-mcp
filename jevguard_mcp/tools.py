@@ -1,11 +1,12 @@
 """
 JevGuard MCP Tools - Tool registration and execution engine.
 Implements state pruning, closed-world escape injection, certainty calibration,
-canonical SHA-256 fingerprinting, and deterministic evaluation.
+canonical SHA-256 fingerprinting, hardened caching, and deterministic evaluation.
 All operations rely solely on the Python standard library.
 """
 
 import contextlib
+import copy
 import hashlib
 import json
 import logging
@@ -104,6 +105,34 @@ def is_authorized_endpoint(endpoint: str) -> bool:
     return hostname in allowed_hosts
 
 
+def _sanitize_bool(val: Any, field_name: str = "field") -> bool:
+    """Strictly validates and casts a boolean parameter, preventing 'false' from becoming True."""
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, str):
+        v = val.strip().lower()
+        if v in ("true", "1", "yes", "on"):
+            return True
+        elif v in ("false", "0", "no", "off", ""):
+            return False
+        raise ValueError(f"Invalid boolean value for '{field_name}': '{val}'")
+    if isinstance(val, (int, float)):
+        if val == 1:
+            return True
+        elif val == 0:
+            return False
+        raise ValueError(f"Invalid numeric boolean for '{field_name}': {val}")
+    raise ValueError(f"Invalid type for boolean field '{field_name}': {type(val).__name__}")
+
+
+def is_escape_selected(choice: Any) -> bool:
+    """Checks whether a selected choice represents a neutral escape candidate."""
+    if not isinstance(choice, str):
+        return False
+    c = choice.strip().lower()
+    return c in ESCAPE_CANDIDATE_KEYS or c == ESCAPE_OPTION_KEY.lower()
+
+
 class StatePruner:
     """Removes empty values, nulls, and duplicate whitespace while preventing cycles."""
 
@@ -199,7 +228,7 @@ def get_default_cache_db_path(custom_path: Optional[str] = None) -> str:
     - Defaults to Path.home() / '.cache' / 'jevguard' / 'decision_cache.db'.
     - Honors JEVGUARD_CACHE_PATH environment variable if custom_path is None.
     - If ':memory:', returns ':memory:'.
-    - If a relative path is passed (or set via env), resolves it inside ~/.cache/jevguard.
+    - If a relative path is passed (or set via env), resolves it inside ~/.cache/jevguard without escaping via '..'.
     - Gracefully falls back to ':memory:' upon any filesystem or permission error.
     """
     raw_path = custom_path
@@ -212,18 +241,23 @@ def get_default_cache_db_path(custom_path: Optional[str] = None) -> str:
             return ":memory:"
 
     try:
-        base_dir = Path.home() / ".cache" / "jevguard"
+        base_dir = (Path.home() / ".cache" / "jevguard").resolve()
         if raw_path:
             p = Path(raw_path)
             if p.is_absolute():
-                target_path = p
+                target_path = p.resolve()
             else:
-                target_path = base_dir / p
+                candidate = (base_dir / p).resolve()
+                try:
+                    candidate.relative_to(base_dir)
+                    target_path = candidate
+                except ValueError:
+                    target_path = base_dir / p.name
         else:
             target_path = base_dir / "decision_cache.db"
 
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        return str(target_path.resolve())
+        return str(target_path)
     except (OSError, PermissionError) as err:
         logger.warning(
             "Permission or filesystem error determining cache db path for '%s': %s. Falling back to ':memory:'.",
@@ -244,17 +278,22 @@ class DeterministicCache:
         ttl_seconds: Optional[float] = None,
     ):
         self.db_path = get_default_cache_db_path(db_path)
-        self.max_memory_items = max_memory_items
+        self.max_memory_items = max(1, int(max_memory_items)) if max_memory_items is not None else 500
         raw_ttl = os.environ.get("JEVGUARD_CACHE_TTL")
+        parsed_ttl: float = 3600.0
         if raw_ttl is not None:
             try:
-                self.ttl_seconds = float(raw_ttl)
+                parsed_ttl = float(raw_ttl)
             except (ValueError, TypeError):
-                self.ttl_seconds = 3600.0
+                parsed_ttl = 3600.0
         elif ttl_seconds is not None:
-            self.ttl_seconds = float(ttl_seconds)
-        else:
-            self.ttl_seconds = 3600.0
+            try:
+                parsed_ttl = float(ttl_seconds)
+            except (ValueError, TypeError):
+                parsed_ttl = 3600.0
+        if math.isnan(parsed_ttl) or math.isinf(parsed_ttl):
+            parsed_ttl = 3600.0
+        self.ttl_seconds = max(0.0, parsed_ttl)
 
         self.default_ignore_keys = (
             set(DEFAULT_VOLATILE_KEYS).union({str(k).strip().lower().replace("-", "_") for k in default_ignore_keys})
@@ -265,6 +304,7 @@ class DeterministicCache:
         self._lock = threading.RLock()
         self._local = threading.local()
         self._shared_conn: Optional[sqlite3.Connection] = None
+        self._open_conns: Set[sqlite3.Connection] = set()
 
         self.stats = {
             "hits": 0,
@@ -304,89 +344,69 @@ class DeterministicCache:
             if self._shared_conn is None:
                 self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=60.0)
                 self._shared_conn.row_factory = sqlite3.Row
-                try:
-                    self._shared_conn.execute("PRAGMA journal_mode=WAL;")
-                    self._shared_conn.execute("PRAGMA synchronous=NORMAL;")
-                    self._shared_conn.execute("PRAGMA busy_timeout = 60000;")
-                except Exception:
-                    pass
-                try:
-                    self._shared_conn.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS evaluation_cache (
-                            fingerprint TEXT PRIMARY KEY,
-                            model TEXT NOT NULL,
-                            response_json TEXT NOT NULL,
-                            created_at REAL NOT NULL,
-                            hit_count INTEGER DEFAULT 0,
-                            tokens_estimate INTEGER DEFAULT 0
-                        )
-                        """
-                    )
-                    self._shared_conn.commit()
-                except Exception as init_err:
-                    logger.warning("Error creating table in fallback memory db: %s", init_err)
+            try:
+                self._init_db()
+            except Exception as err:
+                logger.error("Failed to initialize in-memory SQLite fallback: %s", err)
 
     @contextlib.contextmanager
     def _get_connection(self):
-        if self._shared_conn is not None:
+        if self.db_path == ":memory:":
             with self._lock:
+                if self._shared_conn is None:
+                    self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=60.0)
+                    self._shared_conn.row_factory = sqlite3.Row
                 yield self._shared_conn
-        else:
-            conn = getattr(self._local, "conn", None)
-            if conn is None:
-                try:
-                    conn = sqlite3.connect(self.db_path, timeout=60.0)
-                    conn.row_factory = sqlite3.Row
-                    try:
-                        conn.execute("PRAGMA journal_mode=WAL;")
-                        conn.execute("PRAGMA synchronous=NORMAL;")
-                        conn.execute("PRAGMA busy_timeout = 60000;")
-                    except Exception as err:
-                        logger.debug("PRAGMA setup note: %s", err)
-                    self._local.conn = conn
-                except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError, PermissionError) as err:
-                    logger.warning(
-                        "SQLite connection error to %s (%s). Falling back to shared :memory:.",
-                        self.db_path,
-                        err,
-                    )
-                    self._fallback_to_memory()
-                    with self._lock:
-                        yield self._shared_conn
-                    return
-            with self._lock:
-                yield conn
+            return
 
-    def _init_db(self) -> None:
-        try:
-            with self._get_connection() as conn:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
+            try:
+                conn = sqlite3.connect(self.db_path, timeout=60.0)
+                conn.row_factory = sqlite3.Row
                 try:
                     conn.execute("PRAGMA journal_mode=WAL;")
                     conn.execute("PRAGMA synchronous=NORMAL;")
                     conn.execute("PRAGMA busy_timeout = 60000;")
-                except Exception as err:
-                    logger.debug("PRAGMA init note: %s", err)
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS evaluation_cache (
-                        fingerprint TEXT PRIMARY KEY,
-                        model TEXT NOT NULL,
-                        response_json TEXT NOT NULL,
-                        created_at REAL NOT NULL,
-                        hit_count INTEGER DEFAULT 0,
-                        tokens_estimate INTEGER DEFAULT 0
-                    )
-                    """
+                except sqlite3.OperationalError:
+                    pass
+                self._local.conn = conn
+                with self._lock:
+                    self._open_conns.add(conn)
+            except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError, PermissionError) as err:
+                logger.warning(
+                    "SQLite connection error to %s (%s). Falling back to shared :memory:.",
+                    self.db_path,
+                    err,
                 )
-                conn.commit()
-        except (sqlite3.OperationalError, sqlite3.DatabaseError, OSError, PermissionError) as err:
-            logger.warning(
-                "SQLite _init_db error at %s (%s). Falling back to shared :memory:.",
-                self.db_path,
-                err,
+                self._fallback_to_memory()
+                with self._lock:
+                    yield self._shared_conn
+                return
+
+        yield conn
+
+    def _init_db(self) -> None:
+        with self._get_connection() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS evaluation_cache (
+                    fingerprint TEXT PRIMARY KEY,
+                    model TEXT NOT NULL,
+                    response_json TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    hit_count INTEGER NOT NULL DEFAULT 0,
+                    tokens_estimate INTEGER NOT NULL DEFAULT 0
+                );
+                """
             )
-            self._fallback_to_memory()
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_evaluation_cache_created
+                ON evaluation_cache(created_at);
+                """
+            )
+            conn.commit()
 
     @classmethod
     def _strip_volatile_keys(
@@ -409,7 +429,7 @@ class DeterministicCache:
         try:
             if isinstance(data, dict):
                 cleaned: Dict[str, Any] = {}
-                for key, value in data.items():
+                for key, value in sorted(data.items(), key=lambda x: str(x[0])):
                     norm_key = str(key).strip().lower().replace("-", "_")
                     if norm_key in ignore_keys:
                         continue
@@ -441,7 +461,15 @@ class DeterministicCache:
         state: Any = None,
         wire_questions: Optional[Dict[str, Any]] = None,
         ignore_keys: Optional[Iterable[str]] = None,
+        endpoint: Optional[str] = None,
+        tenant_id: Optional[str] = None,
+        runtime_version: str = "1.0.2",
+        api_key_identity: Optional[str] = None,
+        **kwargs: Any,
     ) -> str:
+        if tenant_id is None and api_key_identity is not None:
+            tenant_id = api_key_identity
+        # Flexible positional signature backwards compatibility
         if isinstance(model, (dict, list)):
             if wire_questions is not None and not isinstance(wire_questions, dict):
                 ignore_keys = wire_questions
@@ -465,9 +493,12 @@ class DeterministicCache:
         )
 
         canonical_struct = {
+            "endpoint": str(endpoint or "").strip().lower(),
             "model": str(target_model).strip().lower(),
             "questions": target_questions,
+            "runtime_version": str(runtime_version).strip(),
             "state": filtered_state,
+            "tenant_id": str(tenant_id or "").strip(),
         }
         canonical_bytes = json.dumps(
             canonical_struct,
@@ -480,6 +511,8 @@ class DeterministicCache:
 
     def get(self, fingerprint: str) -> Optional[Dict[str, Any]]:
         with self._lock:
+            if self.ttl_seconds <= 0:
+                return None
             if fingerprint in self._memory_lru:
                 item = self._memory_lru[fingerprint]
                 entry_time = item.get("created_at", 0.0)
@@ -490,7 +523,7 @@ class DeterministicCache:
                     tokens = item.get("tokens_estimate", 0)
                     self.stats["tokens_saved"] += tokens
                     self._promote_lru(fingerprint, item["data"], tokens, created_at=entry_time)
-                    return item["data"]
+                    return copy.deepcopy(item["data"])
 
         try:
             with self._get_connection() as conn:
@@ -505,13 +538,19 @@ class DeterministicCache:
                         conn.execute("DELETE FROM evaluation_cache WHERE fingerprint = ?", (fingerprint,))
                         conn.commit()
                     else:
+                        try:
+                            data = json.loads(row["response_json"])
+                        except Exception:
+                            conn.execute("DELETE FROM evaluation_cache WHERE fingerprint = ?", (fingerprint,))
+                            conn.commit()
+                            return None
+
+                        tokens = row["tokens_estimate"]
                         with self._lock:
                             self.stats["hits"] += 1
-                            data = json.loads(row["response_json"])
-                            tokens = row["tokens_estimate"]
                             self.stats["tokens_saved"] += tokens
                             self._promote_lru(fingerprint, data, tokens, created_at=entry_created_at)
-                        return data
+                        return copy.deepcopy(data)
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
             logger.warning("Cache lookup database error for %s: %s. Falling back to :memory:.", fingerprint, err)
             self._fallback_to_memory()
@@ -529,9 +568,13 @@ class DeterministicCache:
         response_data: Dict[str, Any],
         input_tokens_estimate: int = 0,
     ) -> None:
+        if self.ttl_seconds <= 0:
+            return
+
         now = time.time()
+        data_to_store = copy.deepcopy(response_data)
         try:
-            raw_json = json.dumps(response_data, separators=(",", ":"), default=str)
+            raw_json = json.dumps(data_to_store, separators=(",", ":"), default=str)
             with self._get_connection() as conn:
                 conn.execute(
                     """
@@ -557,46 +600,22 @@ class DeterministicCache:
                     expired_keys = [k for k, v in self._memory_lru.items() if (now - v.get("created_at", 0.0)) > self.ttl_seconds]
                     for k in expired_keys:
                         del self._memory_lru[k]
-                self._promote_lru(fingerprint, response_data, input_tokens_estimate, created_at=now)
+                self._promote_lru(fingerprint, data_to_store, input_tokens_estimate, created_at=now)
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
-            logger.warning("Cache write database error for %s: %s. Falling back to :memory:.", fingerprint, err)
+            logger.warning("Cache put database error for %s: %s. Falling back to :memory:.", fingerprint, err)
             self._fallback_to_memory()
-            try:
-                with self._get_connection() as conn:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO evaluation_cache (
-                            fingerprint, model, response_json, created_at, hit_count, tokens_estimate
-                        ) VALUES (?, ?, ?, ?, COALESCE((SELECT hit_count FROM evaluation_cache WHERE fingerprint = ?), 0), ?)
-                        """,
-                        (
-                            fingerprint,
-                            model,
-                            raw_json,
-                            now,
-                            fingerprint,
-                            input_tokens_estimate,
-                        ),
-                    )
-                    if self.ttl_seconds > 0:
-                        conn.execute("DELETE FROM evaluation_cache WHERE created_at < ?", (now - self.ttl_seconds,))
-                    conn.commit()
-                with self._lock:
-                    if self.ttl_seconds > 0:
-                        expired_keys = [k for k, v in self._memory_lru.items() if (now - v.get("created_at", 0.0)) > self.ttl_seconds]
-                        for k in expired_keys:
-                            del self._memory_lru[k]
-                    self._promote_lru(fingerprint, response_data, input_tokens_estimate, created_at=now)
-            except Exception as retry_err:
-                logger.warning("In-memory cache write retry error: %s", retry_err)
+            with self._lock:
+                self._promote_lru(fingerprint, data_to_store, input_tokens_estimate, created_at=now)
         except Exception as err:
-            logger.warning("Cache write error for %s: %s", fingerprint, err)
+            logger.warning("Cache put error for %s: %s", fingerprint, err)
+            with self._lock:
+                self._promote_lru(fingerprint, data_to_store, input_tokens_estimate, created_at=now)
 
     def _promote_lru(
         self,
         fingerprint: str,
         data: Dict[str, Any],
-        tokens_estimate: int,
+        tokens_estimate: int = 0,
         created_at: Optional[float] = None,
     ) -> None:
         if fingerprint in self._memory_lru:
@@ -607,7 +626,9 @@ class DeterministicCache:
             hit_count = 0
             entry_time = created_at or time.time()
 
-        if len(self._memory_lru) >= self.max_memory_items:
+        while len(self._memory_lru) >= self.max_memory_items:
+            if not self._memory_lru:
+                break
             oldest_key = next(iter(self._memory_lru))
             del self._memory_lru[oldest_key]
 
@@ -621,38 +642,17 @@ class DeterministicCache:
     def clear(self) -> None:
         with self._lock:
             self._memory_lru.clear()
-            self.stats["hits"] = 0
-            self.stats["misses"] = 0
-            self.stats["tokens_saved"] = 0
-        try:
-            with self._get_connection() as conn:
-                conn.execute("DELETE FROM evaluation_cache")
-                conn.commit()
-        except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
-            logger.warning("Cache clear database error: %s. Falling back to :memory:.", err)
-            self._fallback_to_memory()
-        except Exception as err:
-            logger.warning("Cache clear error: %s", err)
-
-    def get_stats(self) -> Dict[str, Any]:
-        with self._lock:
-            total = self.stats["hits"] + self.stats["misses"]
-            rate = round((self.stats["hits"] / total) * 100, 2) if total > 0 else 0.0
-            return {
-                "hit_rate_pct": rate,
-                "hits": self.stats["hits"],
-                "misses": self.stats["misses"],
-                "tokens_saved": self.stats["tokens_saved"],
-            }
+            self.stats = {"hits": 0, "misses": 0, "tokens_saved": 0}
+            try:
+                with self._get_connection() as conn:
+                    conn.execute("DELETE FROM evaluation_cache;")
+                    conn.commit()
+            except Exception as err:
+                logger.warning("Error clearing cache database: %s", err)
 
     def close(self) -> None:
         with self._lock:
-            if self._shared_conn is not None:
-                try:
-                    self._shared_conn.close()
-                except Exception:
-                    pass
-                self._shared_conn = None
+            self._memory_lru.clear()
             conn = getattr(self._local, "conn", None)
             if conn is not None:
                 try:
@@ -660,10 +660,55 @@ class DeterministicCache:
                 except Exception:
                     pass
                 self._local.conn = None
+            if self._shared_conn is not None:
+                try:
+                    self._shared_conn.close()
+                except Exception:
+                    pass
+                self._shared_conn = None
+
+
+class RateLimiter:
+    """Thread-safe in-memory rate limiter using a sliding window."""
+
+    def __init__(
+        self,
+        max_requests: int = 120,
+        window_seconds: float = 60.0,
+        max_per_minute: Optional[int] = None,
+    ):
+        if max_per_minute is not None:
+            max_requests = max_per_minute
+            window_seconds = 60.0
+        self.max_requests = max(1, max_requests)
+        self.window_seconds = max(1.0, float(window_seconds))
+        self.client_timestamps: Dict[str, List[float]] = {}
+        self.timestamps: List[float] = []
+        self._lock = threading.Lock()
+
+    def acquire(self, client_id: Optional[str] = None) -> bool:
+        with self._lock:
+            now = time.time()
+            cutoff = now - self.window_seconds
+            if client_id is not None:
+                ts_list = self.client_timestamps.setdefault(client_id, [])
+                ts_list = [t for t in ts_list if t > cutoff]
+                if len(ts_list) >= self.max_requests:
+                    self.client_timestamps[client_id] = ts_list
+                    return False
+                ts_list.append(now)
+                self.client_timestamps[client_id] = ts_list
+                return True
+            else:
+                self.timestamps = [t for t in self.timestamps if t > cutoff]
+                if len(self.timestamps) >= self.max_requests:
+                    return False
+                self.timestamps.append(now)
+                return True
 
 
 class ResponseCalibrator:
-    """Evaluates probability spread on decisions to detect ambiguity and flat distributions."""
+    """Calibrates choice distributions, score rankings, and continuous probabilities."""
 
     MIN_TOP_PROBABILITY: float = 0.40
     MIN_DISPERSION_GAP: float = 0.15
@@ -679,9 +724,47 @@ class ResponseCalibrator:
         self.min_dispersion_gap = min_dispersion_gap
         self.noul_margin = noul_uncertainty_margin
 
-    def calibrate(self, raw_answers: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    def calibrate(
+        self,
+        raw_answers: Dict[str, Any],
+        expected_questions: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         calibrated: Dict[str, Any] = {}
         ambiguous_questions: List[str] = []
+
+        if not isinstance(raw_answers, dict):
+            raw_answers = {}
+
+        # 1. Verify all expected questions exist in raw_answers
+        if expected_questions:
+            for q_name in expected_questions.keys():
+                if q_name not in raw_answers:
+                    calibrated[q_name] = {
+                        "is_ambiguous": True,
+                        "status": "AMBIGUOUS_STATE",
+                        "calibration": {
+                            "reasons": ["missing_answer", f"missing_answer: {q_name}"],
+                            "expected": True,
+                        },
+                        "raw": None,
+                    }
+                    ambiguous_questions.append(q_name)
+
+        if not raw_answers:
+            all_reasons = ["empty_answers", "empty_answers_payload"]
+            for it in calibrated.values():
+                if isinstance(it, dict) and "calibration" in it:
+                    all_reasons.extend(it["calibration"].get("reasons", []))
+            summary = {
+                "ambiguous_count": len(ambiguous_questions) or (len(expected_questions) if expected_questions else 1),
+                "ambiguous_questions": ambiguous_questions or (list(expected_questions.keys()) if expected_questions else ["unspecified"]),
+                "has_ambiguity": True,
+                "total_evaluated": len(calibrated),
+                "verdict": "AMBIGUOUS_STATE",
+                "status": "AMBIGUOUS_STATE",
+                "reasons": sorted(list(set(all_reasons))),
+            }
+            return calibrated, summary
 
         for name, ans in raw_answers.items():
             if not isinstance(ans, dict):
@@ -711,10 +794,15 @@ class ResponseCalibrator:
                     "question_type": q_type,
                 }
 
-            if item.get("is_ambiguous", False):
+            if item.get("is_ambiguous", False) and name not in ambiguous_questions:
                 ambiguous_questions.append(name)
 
             calibrated[name] = item
+
+        all_reasons = []
+        for it in calibrated.values():
+            if isinstance(it, dict) and "calibration" in it:
+                all_reasons.extend(it["calibration"].get("reasons", []))
 
         summary = {
             "ambiguous_count": len(ambiguous_questions),
@@ -722,11 +810,18 @@ class ResponseCalibrator:
             "has_ambiguity": len(ambiguous_questions) > 0,
             "total_evaluated": len(calibrated),
             "verdict": "AMBIGUOUS_STATE" if ambiguous_questions else "CONFIDENT",
+            "status": "AMBIGUOUS_STATE" if ambiguous_questions else "CONFIDENT",
+            "reasons": sorted(list(set(all_reasons))),
         }
 
         return calibrated, summary
 
     def _calibrate_choice(self, item: Dict[str, Any]) -> None:
+        reasons: List[str] = []
+        raw_choice = item.get("choice")
+        if raw_choice is None or not str(raw_choice).strip():
+            reasons.append("missing_choice_value")
+
         probs = item.get("probabilities", {})
         parsed_pairs: List[Tuple[str, float]] = []
         has_invalid = False
@@ -734,28 +829,29 @@ class ResponseCalibrator:
             for k, v in probs.items():
                 try:
                     val = float(v)
-                    if math.isnan(val) or math.isinf(val):
+                    if math.isnan(val) or math.isinf(val) or val < 0.0 or val > 1.0:
                         has_invalid = True
                     else:
                         parsed_pairs.append((str(k), val))
                 except (ValueError, TypeError):
                     has_invalid = True
+        else:
+            has_invalid = True
 
         if not parsed_pairs:
             try:
                 raw_conf = item.get("confidence", 0.0)
                 conf = float(raw_conf)
-                if math.isnan(conf) or math.isinf(conf):
+                if math.isnan(conf) or math.isinf(conf) or conf < 0.0 or conf > 1.0:
                     conf = 0.0
                     has_invalid = True
             except (ValueError, TypeError):
                 conf = 0.0
                 has_invalid = True
 
-            reasons = []
             if has_invalid:
                 reasons.append("invalid_probability")
-            if conf < self.min_top_prob:
+            if conf < self.min_top_prob and "low_confidence" not in reasons:
                 reasons.append("low_confidence")
 
             is_amb = len(reasons) > 0
@@ -766,23 +862,32 @@ class ResponseCalibrator:
                 "reasons": reasons,
                 "runner_up_choice": None,
                 "runner_up_probability": 0.0,
-                "top_choice": item.get("choice"),
+                "top_choice": raw_choice,
                 "top_probability": round(conf, 4),
             }
             return
+
+        # Check sum of probabilities
+        prob_sum = sum(p for _, p in parsed_pairs)
+        if len(parsed_pairs) >= 2 and abs(prob_sum - 1.0) > 0.05:
+            reasons.append("invalid_probability_sum")
 
         sorted_pairs = sorted(parsed_pairs, key=lambda x: x[1], reverse=True)
         top_k, top_p = sorted_pairs[0]
         runner_k, runner_p = sorted_pairs[1] if len(sorted_pairs) > 1 else (None, 0.0)
         gap = top_p - runner_p
 
-        reasons: List[str] = []
-        if has_invalid:
+        if has_invalid and "invalid_probability" not in reasons:
             reasons.append("invalid_probability")
-        if top_p < self.min_top_prob:
+        if top_p < self.min_top_prob and "low_confidence" not in reasons:
             reasons.append("low_confidence")
-        if len(sorted_pairs) > 1 and gap < self.min_dispersion_gap:
+        if len(sorted_pairs) > 1 and gap < self.min_dispersion_gap and "flat_distribution" not in reasons:
             reasons.append("flat_distribution")
+
+        # Confront raw_choice with top_choice
+        if raw_choice is not None and top_k is not None:
+            if str(raw_choice).strip() != str(top_k).strip():
+                reasons.append("choice_probability_mismatch")
 
         is_amb = len(reasons) > 0
         item["is_ambiguous"] = is_amb
@@ -798,6 +903,10 @@ class ResponseCalibrator:
 
     def _calibrate_score(self, item: Dict[str, Any]) -> None:
         reasons: List[str] = []
+        raw_score = item.get("score")
+        if raw_score is None:
+            reasons.append("missing_score_value")
+
         raw_conf = item.get("confidence")
         if raw_conf is None:
             conf = 0.0
@@ -805,7 +914,7 @@ class ResponseCalibrator:
         else:
             try:
                 conf = float(raw_conf)
-                if math.isnan(conf) or math.isinf(conf):
+                if math.isnan(conf) or math.isinf(conf) or conf < 0.0 or conf > 1.0:
                     conf = 0.0
                     reasons.append("invalid_probability")
             except (ValueError, TypeError):
@@ -823,7 +932,7 @@ class ResponseCalibrator:
             for v in probs.values():
                 try:
                     val = float(v)
-                    if math.isnan(val) or math.isinf(val):
+                    if math.isnan(val) or math.isinf(val) or val < 0.0 or val > 1.0:
                         if "invalid_probability" not in reasons:
                             reasons.append("invalid_probability")
                     else:
@@ -832,6 +941,9 @@ class ResponseCalibrator:
                     if "invalid_probability" not in reasons:
                         reasons.append("invalid_probability")
             if len(parsed_probs) >= 2:
+                prob_sum = sum(parsed_probs)
+                if abs(prob_sum - 1.0) > 0.05 and "invalid_probability_sum" not in reasons:
+                    reasons.append("invalid_probability_sum")
                 sorted_probs = sorted(parsed_probs, reverse=True)
                 top_p = sorted_probs[0]
                 runner_p = sorted_probs[1]
@@ -848,6 +960,7 @@ class ResponseCalibrator:
             "confidence": round(conf, 4),
             "dispersion_gap": round(dispersion_gap, 4),
             "reasons": reasons,
+            "score": raw_score,
         }
 
     def _calibrate_noul(self, item: Dict[str, Any]) -> None:
@@ -873,19 +986,18 @@ class ResponseCalibrator:
             }
             return
 
-        if math.isnan(prob) or math.isinf(prob):
+        if math.isnan(prob) or math.isinf(prob) or prob < 0.0 or prob > 1.0:
             item["is_ambiguous"] = True
             item["status"] = "AMBIGUOUS_STATE"
             item["calibration"] = {
                 "boundary_distance": 0.0,
                 "probability": 0.0,
-                "reasons": ["invalid_probability"],
+                "reasons": ["invalid_probability", "invalid_noul_range"],
             }
             return
 
         dist = abs(prob - 0.50)
         is_amb = dist < self.noul_margin
-
         item["is_ambiguous"] = is_amb
         item["status"] = "AMBIGUOUS_STATE" if is_amb else "CONFIDENT"
         item["calibration"] = {
@@ -905,17 +1017,19 @@ class QuestionOptimizer:
     def normalize_questions(
         self,
         questions: Union[Dict[str, Any], List[Dict[str, Any]]],
-        auto_inject_escapes: bool = True,
+        auto_inject_escapes: Optional[bool] = None,
     ) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, str]]:
         if not questions:
             raise ValueError("Questions payload cannot be empty.")
+
+        should_inject = self.auto_inject_escapes if auto_inject_escapes is None else bool(auto_inject_escapes)
 
         wire_questions: Dict[str, Dict[str, Any]] = {}
         injected_escapes: Dict[str, str] = {}
 
         if isinstance(questions, dict):
             for name, q in questions.items():
-                wire_q, injected = self._process_question(name, q, auto_inject_escapes=auto_inject_escapes)
+                wire_q, injected = self._process_question(name, q, auto_inject_escapes=should_inject)
                 wire_questions[name] = wire_q
                 if injected:
                     injected_escapes[name] = ESCAPE_OPTION_KEY
@@ -924,7 +1038,9 @@ class QuestionOptimizer:
                 if not isinstance(q, dict):
                     raise ValueError(f"Question at index {idx} must be a dictionary.")
                 name = str(q.get("name") or f"q_{idx + 1}").strip()
-                wire_q, injected = self._process_question(name, q, auto_inject_escapes=auto_inject_escapes)
+                if name in wire_questions:
+                    raise ValueError(f"Duplicate question name detected in question list: '{name}'")
+                wire_q, injected = self._process_question(name, q, auto_inject_escapes=should_inject)
                 wire_questions[name] = wire_q
                 if injected:
                     injected_escapes[name] = ESCAPE_OPTION_KEY
@@ -945,7 +1061,12 @@ class QuestionOptimizer:
         if "type" not in q:
             raise ValueError(f"Question '{name}' definition missing required 'type' field.")
         q_type = str(q.get("type", "")).strip().lower()
-        instructions = str(q.get("instructions") or q.get("question") or "")
+
+        raw_instr = q.get("instructions") if q.get("instructions") is not None else q.get("question")
+        if isinstance(raw_instr, (dict, list)):
+            instructions = raw_instr
+        else:
+            instructions = str(raw_instr or "").strip()
 
         allow_escape = True
         wire_dict: Dict[str, Any] = {}
@@ -960,10 +1081,8 @@ class QuestionOptimizer:
 
         elif q_type == "score":
             criteria = q.get("criteria")
-            if criteria is None:
-                criteria = []
-            elif not isinstance(criteria, list):
-                criteria = [criteria]
+            if not criteria or not isinstance(criteria, list) or len(criteria) == 0:
+                raise ValueError(f"Score question '{name}' must define at least one rubric criterion in 'criteria'.")
             wire_dict = {
                 "type": "score",
                 "instructions": instructions,
@@ -976,7 +1095,15 @@ class QuestionOptimizer:
                 raw_crit = {str(item): str(item) for item in raw_crit}
             elif not isinstance(raw_crit, dict):
                 raw_crit = {}
-            criteria = {str(k): str(v) for k, v in raw_crit.items()}
+
+            criteria = {}
+            for k, v in raw_crit.items():
+                key_str = str(k).strip()
+                if isinstance(v, (dict, list)):
+                    criteria[key_str] = v
+                else:
+                    criteria[key_str] = str(v)
+
             closed = bool(q.get("closed_world", False))
             allow_esc_opt = q.get("auto_inject_escape")
             if allow_esc_opt is None:
@@ -1029,10 +1156,8 @@ class QuestionOptimizer:
         metadata = {
             "auto_inject_escapes_enabled": should_inject,
             "estimated_tokens": StatePruner.estimate_tokens(wire_payload),
-            "has_injected_escapes": len(injected_escapes) > 0,
             "injected_escapes": injected_escapes,
-            "model": target_model,
-            "total_questions": len(wire_questions),
+            "question_count": len(wire_questions),
         }
 
         return wire_payload, metadata
@@ -1041,12 +1166,23 @@ class QuestionOptimizer:
 class ToolRegistry:
     """Registry maintaining tool schemas and operational handlers."""
 
-    def __init__(self, cache_db_path: Optional[str] = None, allow_test_mocks: bool = False):
+    def __init__(self, cache_db_path: Optional[str] = None, allow_test_mocks: Optional[bool] = None):
         self._lock = threading.RLock()
         self.cache = DeterministicCache(db_path=cache_db_path)
         self.optimizer = QuestionOptimizer()
         self.calibrator = ResponseCalibrator()
-        self.allow_test_mocks = allow_test_mocks or (os.environ.get("JEVGUARD_TEST_MODE") == "1")
+        self.rate_limiter = RateLimiter(max_requests=120, window_seconds=60.0)
+
+        if allow_test_mocks is not None:
+            self.allow_test_mocks = bool(allow_test_mocks)
+        else:
+            self.allow_test_mocks = (os.environ.get("JEVGUARD_TEST_MODE") == "1")
+
+    def close(self) -> None:
+        """Closes underlying cache connections and resources."""
+        with self._lock:
+            if hasattr(self, "cache") and self.cache is not None:
+                self.cache.close()
 
     def get_definitions(self) -> List[Dict[str, Any]]:
         with self._lock:
@@ -1064,11 +1200,11 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "state": {
-                            "type": "object",
+                            "type": ["object", "string", "array"],
                             "description": "Input state payload dictionary or structure to evaluate against criteria.",
                         },
                         "questions": {
-                            "type": "object",
+                            "type": ["object", "array"],
                             "description": "Dictionary of question definitions mapping question keys to criteria (noul, score, choice).",
                         },
                         "model": {
@@ -1088,8 +1224,13 @@ class ToolRegistry:
                         },
                         "timeout": {
                             "type": "number",
-                            "description": "HTTP request timeout in seconds (default: 30.0).",
+                            "description": "HTTP request timeout in seconds (default: 30.0, max: 60.0).",
                             "default": 30.0,
+                        },
+                        "ignore_keys": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional list of additional volatile state keys to mask during fingerprinting.",
                         },
                     },
                     "required": ["state", "questions"],
@@ -1141,8 +1282,8 @@ class ToolRegistry:
                     "type": "object",
                     "properties": {
                         "state": {
-                            "type": "object",
-                            "description": "The state payload dictionary or structure to sanitize and prune.",
+                            "type": ["object", "string", "array"],
+                            "description": "The state payload dictionary, list, or structure to sanitize and prune.",
                         },
                         "prune_lists": {
                             "type": "boolean",
@@ -1156,21 +1297,20 @@ class ToolRegistry:
             {
                 "name": "jevguard_cache_fingerprint",
                 "description": (
-                    "Calculates a canonical SHA-256 cache fingerprint for a state and model offline, "
-                    "deterministically sorting keys and masking volatile ephemeral fields (timestamps, trace IDs, "
-                    "request IDs). Use this tool ONLY to preview or verify the deterministic cache key of a payload "
-                    "without executing evaluation. Do NOT use for pruning state or executing decisions."
+                    "Calculates a canonical SHA-256 fingerprint for a state and question set offline with "
+                    "volatile key masking (e.g. timestamps, trace IDs). Use this tool ONLY to compute or verify "
+                    "the exact deterministic cache key for a state. Do NOT use for making decisions."
                 ),
                 "inputSchema": {
                     "type": "object",
                     "properties": {
                         "state": {
-                            "type": "object",
-                            "description": "State payload dictionary to include in fingerprint computation.",
+                            "type": ["object", "string", "array"],
+                            "description": "The state payload dictionary or structure to fingerprint.",
                         },
                         "questions": {
-                            "type": "object",
-                            "description": "Question definitions dictionary (optional).",
+                            "type": ["object", "array"],
+                            "description": "Optional questions dictionary to bind to the fingerprint.",
                         },
                         "model": {
                             "type": "string",
@@ -1179,13 +1319,13 @@ class ToolRegistry:
                         },
                         "auto_inject_escapes": {
                             "type": "boolean",
-                            "description": "Whether to consider escape injection logic when computing fingerprint (default: true).",
+                            "description": "Whether escape option normalization is applied before hashing.",
                             "default": True,
                         },
                         "ignore_keys": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "List of volatile keys to mask in addition to standard defaults.",
+                            "description": "Optional list of additional volatile state keys to mask during fingerprinting.",
                         },
                     },
                     "required": ["state"],
@@ -1205,27 +1345,17 @@ class ToolRegistry:
                     "properties": {
                         "command": {
                             "type": "string",
-                            "description": "Terminal command string to evaluate.",
+                            "description": "The shell or terminal command to evaluate for destructive potential.",
                         },
                         "working_dir": {
                             "type": "string",
-                            "description": "Working directory for execution context (optional).",
+                            "description": "Target working directory where the command would execute.",
                             "default": "",
                         },
                         "elevated_privileges": {
                             "type": "boolean",
-                            "description": "Whether execution uses sudo or administrative privileges (optional, default: false).",
+                            "description": "Whether the command runs with sudo or administrator privileges.",
                             "default": False,
-                        },
-                        "timeout": {
-                            "type": "number",
-                            "description": "HTTP request timeout in seconds (default: 30.0).",
-                            "default": 30.0,
-                        },
-                        "bypass_cache": {
-                            "type": "boolean",
-                            "description": "Bypass deterministic cache lookup.",
-                            "default": True,
                         },
                     },
                     "required": ["command"],
@@ -1244,27 +1374,17 @@ class ToolRegistry:
                     "properties": {
                         "patch_content": {
                             "type": "string",
-                            "description": "Diff or patch content to verify.",
+                            "description": "Unified git diff or source patch text to inspect.",
                         },
                         "target_file": {
                             "type": "string",
-                            "description": "Path of the target file being modified.",
+                            "description": "Path to the target source file being modified by the patch.",
                         },
                         "risk_tolerance": {
                             "type": "string",
                             "enum": ["strict", "balanced", "permissive"],
-                            "description": "Risk tolerance threshold for acceptance (strict, balanced, permissive; default: balanced).",
+                            "description": "Risk tolerance threshold for verification approval.",
                             "default": "balanced",
-                        },
-                        "timeout": {
-                            "type": "number",
-                            "description": "HTTP request timeout in seconds (default: 30.0).",
-                            "default": 30.0,
-                        },
-                        "bypass_cache": {
-                            "type": "boolean",
-                            "description": "Bypass deterministic cache lookup.",
-                            "default": True,
                         },
                     },
                     "required": ["patch_content", "target_file"],
@@ -1284,26 +1404,16 @@ class ToolRegistry:
                     "properties": {
                         "context": {
                             "type": "string",
-                            "description": "Context and constraints surrounding the decision.",
+                            "description": "Background context and constraints informing the decision.",
                         },
                         "decision_question": {
                             "type": "string",
-                            "description": "The specific question or decision to evaluate.",
+                            "description": "Core decision question to evaluate.",
                         },
                         "options": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "Candidate options list (e.g. ['A', 'B', 'C']).",
-                        },
-                        "timeout": {
-                            "type": "number",
-                            "description": "HTTP request timeout in seconds (default: 30.0).",
-                            "default": 30.0,
-                        },
-                        "bypass_cache": {
-                            "type": "boolean",
-                            "description": "Bypass deterministic cache lookup.",
-                            "default": False,
+                            "description": "List of mutually exclusive candidate options to select from.",
                         },
                     },
                     "required": ["context", "decision_question", "options"],
@@ -1326,94 +1436,127 @@ class ToolRegistry:
         return None
 
     def execute_tool(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-        with self._lock:
-            if not isinstance(arguments, dict):
-                return {
-                    "status": "error",
-                    "success": False,
-                    "error_type": "ValueError",
-                    "message": f"Tool arguments must be a dictionary, got {type(arguments).__name__}",
-                    "verdict": "MANUAL_REVIEW_REQUIRED",
-                    "fallback_action": "MANUAL_REVIEW_REQUIRED",
-                }
+        if not isinstance(arguments, dict):
+            raise ValueError(f"Tool arguments must be a dictionary, got {type(arguments).__name__}")
 
-            handler_map = {
-                "jevguard_prune_state": self._tool_prune_state,
-                "jevguard_cache_fingerprint": self._tool_cache_fingerprint,
-                "jevguard_calibrate": self._tool_calibrate,
-                "jevguard_evaluate": self._tool_evaluate,
-                "jevguard_evaluate_command_safety": self._tool_evaluate_command_safety,
-                "jevguard_verify_code_patch": self._tool_verify_code_patch,
-                "jevguard_evaluate_decision": self._tool_evaluate_decision,
-                # Backward compatibility aliases for legacy clients
-                "evaluate_command_safety": self._tool_evaluate_command_safety,
-                "verify_code_patch": self._tool_verify_code_patch,
-                "evaluate_decision": self._tool_evaluate_decision,
+        if not self.rate_limiter.acquire():
+            return {
+                "status": "error",
+                "success": False,
+                "error_type": "RateLimitError",
+                "message": "Client rate limit exceeded (120 requests/minute).",
+                "verdict": "MANUAL_REVIEW_REQUIRED",
+                "fallback_action": "MANUAL_REVIEW_REQUIRED",
             }
 
-            if name not in handler_map:
-                raise KeyError(f"Unknown tool: '{name}'")
+        handler_map = {
+            "jevguard_prune_state": self._tool_prune_state,
+            "jevguard_cache_fingerprint": self._tool_cache_fingerprint,
+            "jevguard_calibrate": self._tool_calibrate,
+            "jevguard_evaluate": self._tool_evaluate,
+            "jevguard_evaluate_command_safety": self._tool_evaluate_command_safety,
+            "jevguard_verify_code_patch": self._tool_verify_code_patch,
+            "jevguard_evaluate_decision": self._tool_evaluate_decision,
+            "evaluate_command_safety": self._tool_evaluate_command_safety,
+            "verify_code_patch": self._tool_verify_code_patch,
+            "evaluate_decision": self._tool_evaluate_decision,
+        }
 
-            allowed_keys = self.get_tool_allowed_properties(name)
-            if allowed_keys is not None:
-                is_test = self.allow_test_mocks or (os.environ.get("JEVGUARD_TEST_MODE") == "1")
-                extra_keys = set(arguments.keys()) - allowed_keys
-                if not is_test:
-                    if "mock_answers" in extra_keys or "_mock_answers" in extra_keys:
-                        return {
-                            "status": "error",
-                            "success": False,
-                            "error_type": "SecurityError",
-                            "message": "Direct mock_answers injection is forbidden in production MCP server.",
-                            "verdict": "MANUAL_REVIEW_REQUIRED",
-                            "fallback_action": "MANUAL_REVIEW_REQUIRED",
-                        }
-                    if extra_keys:
-                        return {
-                            "status": "error",
-                            "success": False,
-                            "error_type": "ValidationError",
-                            "message": f"Unrecognized arguments for tool '{name}': {sorted(list(extra_keys))}",
-                            "verdict": "MANUAL_REVIEW_REQUIRED",
-                            "fallback_action": "MANUAL_REVIEW_REQUIRED",
-                        }
-                else:
-                    test_allowed = {"mock_answers", "_mock_answers"}
-                    unrecognized = extra_keys - test_allowed
-                    if unrecognized:
-                        return {
-                            "status": "error",
-                            "success": False,
-                            "error_type": "ValidationError",
-                            "message": f"Unrecognized arguments for tool '{name}': {sorted(list(unrecognized))}",
-                            "verdict": "MANUAL_REVIEW_REQUIRED",
-                            "fallback_action": "MANUAL_REVIEW_REQUIRED",
-                        }
+        if name not in handler_map:
+            raise KeyError(f"Unknown tool: '{name}'")
 
-            handler = handler_map[name]
-            try:
-                return handler(arguments)
-            except Exception as err:
-                logger.warning("Tool execution error in '%s': %s", name, err)
-                return {
-                    "status": "error",
-                    "success": False,
-                    "error_type": type(err).__name__,
-                    "message": str(err),
-                    "verdict": "MANUAL_REVIEW_REQUIRED",
-                    "fallback_action": "MANUAL_REVIEW_REQUIRED",
-                }
+        allowed_keys = self.get_tool_allowed_properties(name)
+        if allowed_keys is not None:
+            is_test = self.allow_test_mocks
+            extra_keys = set(arguments.keys()) - allowed_keys
+            if not is_test:
+                if "mock_answers" in extra_keys or "_mock_answers" in extra_keys:
+                    return {
+                        "status": "error",
+                        "success": False,
+                        "error_type": "SecurityError",
+                        "message": "Direct mock_answers injection is forbidden in production MCP server.",
+                        "verdict": "MANUAL_REVIEW_REQUIRED",
+                        "fallback_action": "MANUAL_REVIEW_REQUIRED",
+                    }
+                if extra_keys:
+                    return {
+                        "status": "error",
+                        "success": False,
+                        "error_type": "ValidationError",
+                        "message": f"Unrecognized arguments for tool '{name}': {sorted(list(extra_keys))}",
+                        "verdict": "MANUAL_REVIEW_REQUIRED",
+                        "fallback_action": "MANUAL_REVIEW_REQUIRED",
+                    }
+            else:
+                test_allowed = {"mock_answers", "_mock_answers"}
+                unrecognized = extra_keys - test_allowed
+                if unrecognized:
+                    return {
+                        "status": "error",
+                        "success": False,
+                        "error_type": "ValidationError",
+                        "message": f"Unrecognized arguments for tool '{name}': {sorted(list(unrecognized))}",
+                        "verdict": "MANUAL_REVIEW_REQUIRED",
+                        "fallback_action": "MANUAL_REVIEW_REQUIRED",
+                    }
 
-    def close(self) -> None:
-        with self._lock:
-            self.cache.close()
+        # Strictly validate and sanitize argument types
+        sanitized_args = self._validate_and_sanitize_arguments(name, arguments)
+
+        handler = handler_map[name]
+        try:
+            # Execute handler without holding registry lock, preventing network deadlocks
+            return handler(sanitized_args)
+        except Exception as err:
+            logger.warning("Tool execution error in '%s': %s", name, err)
+            return {
+                "status": "error",
+                "success": False,
+                "error_type": type(err).__name__,
+                "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
+                "fallback_action": "MANUAL_REVIEW_REQUIRED",
+            }
+
+    def _validate_and_sanitize_arguments(self, name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+        sanitized = dict(arguments)
+
+        bool_fields = {
+            "prune_lists", "auto_inject_escapes", "bypass_cache",
+            "collapse_whitespace", "elevated_privileges", "auto_inject_escape"
+        }
+        for bf in bool_fields:
+            if bf in sanitized:
+                sanitized[bf] = self._sanitize_bool(sanitized[bf], bf)
+
+        num_fields = {
+            "timeout", "min_top_prob", "min_dispersion_gap", "noul_uncertainty_margin"
+        }
+        for nf in num_fields:
+            if nf in sanitized:
+                sanitized[nf] = self._sanitize_float(sanitized[nf], nf)
+
+        return sanitized
+
+    _sanitize_bool = staticmethod(_sanitize_bool)
+
+    @staticmethod
+    def _sanitize_float(val: Any, field_name: str) -> float:
+        try:
+            f = float(val)
+            if math.isnan(f) or math.isinf(f):
+                raise ValueError()
+            return f
+        except (ValueError, TypeError):
+            raise ValueError(f"Invalid numeric value for argument '{field_name}': {val!r}")
 
     def _tool_prune_state(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         try:
             if "state" not in arguments:
                 raise ValueError("Missing required argument: 'state'")
             state = arguments["state"]
-            prune_lists = bool(arguments.get("prune_lists", False))
+            prune_lists = self._sanitize_bool(arguments.get("prune_lists", False), "prune_lists")
 
             pruned = StatePruner.prune(state, prune_lists=prune_lists)
             tokens_estimate = StatePruner.estimate_tokens(pruned)
@@ -1440,7 +1583,7 @@ class ToolRegistry:
             state = arguments["state"]
             questions = arguments.get("questions") or {}
             model = str(arguments.get("model", "jev-latest")).strip() or "jev-latest"
-            auto_inject = bool(arguments.get("auto_inject_escapes", True))
+            auto_inject = self._sanitize_bool(arguments.get("auto_inject_escapes", True), "auto_inject_escapes")
             ignore_keys = arguments.get("ignore_keys")
 
             wire_questions = questions
@@ -1450,11 +1593,21 @@ class ToolRegistry:
                 except Exception:
                     wire_questions = questions
 
+            # Prune state identically to evaluate so fingerprint matches live evaluation
+            pruned_state = StatePruner.prune(state, collapse_whitespace=True)
+
+            endpoint = str(os.environ.get("TYPESAFE_ENDPOINT") or os.environ.get("JEVGUARD_ENDPOINT") or "https://api.typesafe.ai/v1/systemone").strip()
+            api_key = str(os.environ.get("TYPESAFE_API_KEY", "")).strip()
+            tenant_id = hashlib.sha256(api_key.encode()).hexdigest()[:16] if api_key else None
+
             fp = DeterministicCache.compute_fingerprint(
                 model=model,
-                state=state,
+                state=pruned_state,
                 wire_questions=wire_questions if isinstance(wire_questions, dict) else {},
                 ignore_keys=ignore_keys,
+                endpoint=endpoint,
+                tenant_id=tenant_id,
+                runtime_version="1.0.2",
             )
 
             keys_used = sorted(
@@ -1486,25 +1639,29 @@ class ToolRegistry:
         try:
             if "answers" not in arguments:
                 raise ValueError("Missing required argument: 'answers'")
-            raw_answers = arguments["answers"]
-            if not isinstance(raw_answers, dict):
-                raise ValueError("Argument 'answers' must be a dictionary mapping question names to answers")
+            answers = arguments["answers"]
+            if not isinstance(answers, dict):
+                raise ValueError("Argument 'answers' must be a dictionary")
 
-            min_top_prob = float(arguments.get("min_top_prob", ResponseCalibrator.MIN_TOP_PROBABILITY))
-            min_dispersion_gap = float(arguments.get("min_dispersion_gap", ResponseCalibrator.MIN_DISPERSION_GAP))
-            noul_margin = float(arguments.get("noul_uncertainty_margin", ResponseCalibrator.DEFAULT_NOUL_UNCERTAINTY_MARGIN))
+            min_top_prob = self._sanitize_float(arguments.get("min_top_prob", self.calibrator.min_top_prob), "min_top_prob")
+            min_dispersion = self._sanitize_float(arguments.get("min_dispersion_gap", self.calibrator.min_dispersion_gap), "min_dispersion_gap")
+            noul_margin = self._sanitize_float(arguments.get("noul_uncertainty_margin", self.calibrator.noul_margin), "noul_uncertainty_margin")
 
-            calibrator = ResponseCalibrator(
+            custom_calibrator = ResponseCalibrator(
                 min_top_prob=min_top_prob,
-                min_dispersion_gap=min_dispersion_gap,
+                min_dispersion_gap=min_dispersion,
                 noul_uncertainty_margin=noul_margin,
             )
-            calibrated_answers, summary = calibrator.calibrate(raw_answers)
+
+            calibrated, summary = custom_calibrator.calibrate(answers)
 
             return {
                 "success": True,
-                "calibrated_answers": calibrated_answers,
+                "answers": calibrated,
+                "calibration_summary": summary,
                 "summary": summary,
+                "is_ambiguous": summary["has_ambiguity"],
+                "status": summary["status"],
             }
         except Exception as err:
             logger.warning("Error in jevguard_calibrate: %s", err)
@@ -1527,18 +1684,15 @@ class ToolRegistry:
             state = arguments["state"]
             questions = arguments["questions"]
             model = str(arguments.get("model", "jev-latest")).strip() or "jev-latest"
-            auto_inject = bool(arguments.get("auto_inject_escapes", True))
-            bypass_cache = bool(arguments.get("bypass_cache", False))
-            timeout = float(arguments.get("timeout", 30.0))
+            auto_inject = self._sanitize_bool(arguments.get("auto_inject_escapes", True), "auto_inject_escapes")
+            bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", False), "bypass_cache")
+            timeout = max(1.0, min(self._sanitize_float(arguments.get("timeout", 30.0), "timeout"), 60.0))
+            ignore_keys = arguments.get("ignore_keys")
 
-            # Security: Never accept API key from client/LLM arguments
             api_key = str(os.environ.get("TYPESAFE_API_KEY", "")).strip()
-
-            # Security: Endpoint is governed by server environment configuration
             endpoint = str(os.environ.get("TYPESAFE_ENDPOINT") or os.environ.get("JEVGUARD_ENDPOINT") or "https://api.typesafe.ai/v1/systemone").strip()
 
-            # Security: mock_answers is forbidden in production to prevent verdict forgery
-            is_test = self.allow_test_mocks or (os.environ.get("JEVGUARD_TEST_MODE") == "1")
+            is_test = self.allow_test_mocks
             mock_answers = arguments.get("mock_answers") or arguments.get("_mock_answers")
             if mock_answers is not None and not is_test:
                 return {
@@ -1552,7 +1706,7 @@ class ToolRegistry:
 
             t0 = time.perf_counter()
 
-            collapse_whitespace = bool(arguments.get("collapse_whitespace", True))
+            collapse_whitespace = self._sanitize_bool(arguments.get("collapse_whitespace", True), "collapse_whitespace")
             wire_payload, opt_metadata = self.optimizer.optimize_and_wire(
                 state=state,
                 questions=questions,
@@ -1562,10 +1716,15 @@ class ToolRegistry:
             )
             tokens_estimate = opt_metadata["estimated_tokens"]
 
+            tenant_id = hashlib.sha256(api_key.encode()).hexdigest()[:16] if api_key else None
             fingerprint = DeterministicCache.compute_fingerprint(
                 model=wire_payload["model"],
                 state=wire_payload["state"],
                 wire_questions=wire_payload["questions"],
+                ignore_keys=ignore_keys,
+                endpoint=endpoint,
+                tenant_id=tenant_id,
+                runtime_version="1.0.2",
             )
 
             if not bypass_cache:
@@ -1588,10 +1747,12 @@ class ToolRegistry:
                             "tokens_consumed": 0,
                             "tokens_saved": tokens_estimate,
                         },
+                        "wire_payload": cached_data.get("wire_payload", wire_payload),
                     }
 
             raw_answers: Dict[str, Any] = {}
             inference_latency_ms = 0.0
+            actual_tokens = tokens_estimate
 
             if mock_answers is not None:
                 if not isinstance(mock_answers, dict):
@@ -1605,7 +1766,14 @@ class ToolRegistry:
                     timeout=timeout,
                 )
                 inference_latency_ms = dispatch_res.get("latency_ms", 0.0)
-                raw_answers = dispatch_res.get("data", {}).get("answers", {})
+                data_obj = dispatch_res.get("data", {})
+                raw_answers = data_obj.get("answers", {})
+                usage_info = data_obj.get("usage", {})
+                if isinstance(usage_info, dict) and "input_tokens" in usage_info:
+                    try:
+                        actual_tokens = int(usage_info["input_tokens"])
+                    except (ValueError, TypeError):
+                        actual_tokens = tokens_estimate
             else:
                 return {
                     "status": "error",
@@ -1621,19 +1789,29 @@ class ToolRegistry:
                 }
 
             t_cal0 = time.perf_counter()
-            calibrated_answers, calib_summary = self.calibrator.calibrate(raw_answers)
+            calibrated_answers, calib_summary = self.calibrator.calibrate(
+                raw_answers,
+                expected_questions=wire_payload["questions"],
+            )
             t_cal1 = time.perf_counter()
             calib_ms = round((t_cal1 - t_cal0) * 1000, 3)
 
-            self.cache.put(
-                fingerprint=fingerprint,
-                model=wire_payload["model"],
-                response_data={
-                    "answers": calibrated_answers,
-                    "calibration": calib_summary,
-                },
-                input_tokens_estimate=tokens_estimate,
-            )
+            is_mock = mock_answers is not None
+            source_mode = "mock_evaluation" if is_mock else "live_evaluation"
+
+            # Only cache evaluations with confident, complete results
+            if (not is_mock or self.allow_test_mocks) and not calib_summary.get("has_ambiguity", False):
+                self.cache.put(
+                    fingerprint=fingerprint,
+                    model=wire_payload["model"],
+                    response_data={
+                        "answers": calibrated_answers,
+                        "calibration": calib_summary,
+                        "wire_payload": wire_payload,
+                        "mode": source_mode,
+                    },
+                    input_tokens_estimate=actual_tokens,
+                )
 
             t_end = time.perf_counter()
             total_latency = round((t_end - t0) * 1000, 3)
@@ -1649,8 +1827,8 @@ class ToolRegistry:
                     "latency_calibration_ms": calib_ms,
                     "latency_inference_ms": inference_latency_ms,
                     "latency_total_ms": total_latency,
-                    "mode": "live_evaluation",
-                    "tokens_consumed": tokens_estimate,
+                    "mode": source_mode,
+                    "tokens_consumed": actual_tokens,
                     "tokens_saved": 0,
                 },
                 "wire_payload": wire_payload,
@@ -1674,14 +1852,14 @@ class ToolRegistry:
             if not isinstance(command, str) or not command.strip():
                 raise ValueError("Argument 'command' must be a non-empty string")
 
-            working_dir = str(arguments.get("working_dir", "") or "").strip()
-            elevated = bool(arguments.get("elevated_privileges", False))
+            working_dir = str(arguments.get("working_dir", "")).strip()
+            elevated = self._sanitize_bool(arguments.get("elevated_privileges", False), "elevated_privileges")
             mock_answers = arguments.get("mock_answers")
-            timeout = float(arguments.get("timeout", 30.0))
-            bypass_cache = bool(arguments.get("bypass_cache", True))
+            timeout = max(1.0, min(self._sanitize_float(arguments.get("timeout", 30.0), "timeout"), 60.0))
+            bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", False), "bypass_cache")
 
             state = {
-                "command": command,
+                "command": command.strip(),
                 "working_dir": working_dir,
                 "elevated_privileges": elevated,
             }
@@ -1758,12 +1936,56 @@ class ToolRegistry:
 
             choice_item = answers.get("execution_policy", {})
             raw_choice = choice_item.get("choice")
+            top_choice = choice_item.get("calibration", {}).get("top_choice")
+            deny_prob = choice_item.get("probabilities", {}).get("DENY_DESTRUCTIVE", 0.0)
+            try:
+                deny_prob = float(deny_prob)
+            except (ValueError, TypeError):
+                deny_prob = 0.0
 
-            if raw_choice == "DENY_DESTRUCTIVE" or (noul_prob is not None and noul_prob >= 0.70):
+            # Inspect risk_score
+            score_item = answers.get("risk_score", {})
+            raw_score = score_item.get("score")
+            score_level: Optional[int] = None
+            if raw_score is not None:
+                try:
+                    score_level = int(raw_score)
+                except (ValueError, TypeError):
+                    score_str = str(raw_score).lower()
+                    if "critical" in score_str:
+                        score_level = 4
+                    elif "high" in score_str:
+                        score_level = 3
+                    elif "moderate" in score_str:
+                        score_level = 2
+                    elif "low" in score_str:
+                        score_level = 1
+                    elif "read-only" in score_str or "harmless" in score_str:
+                        score_level = 0
+
+            # Policy calculation
+            if raw_choice == "DENY_DESTRUCTIVE" or (noul_prob is not None and noul_prob >= 0.70) or score_level == 4:
                 policy = "DENY_DESTRUCTIVE"
-            elif elevated or has_ambiguity or noul_prob is None or noul_prob >= 0.35 or raw_choice != "ALLOW_AUTONOMOUS":
+            elif (
+                elevated
+                or has_ambiguity
+                or noul_prob is None
+                or noul_prob >= 0.35
+                or raw_choice != "ALLOW_AUTONOMOUS"
+                or top_choice != "ALLOW_AUTONOMOUS"
+                or deny_prob >= 0.15
+                or (score_level is not None and score_level >= 2)
+            ):
                 policy = "REQUIRE_HUMAN_APPROVAL"
-            elif raw_choice == "ALLOW_AUTONOMOUS" and not elevated and not has_ambiguity and (noul_prob is not None and noul_prob < 0.35):
+            elif (
+                raw_choice == "ALLOW_AUTONOMOUS"
+                and top_choice == "ALLOW_AUTONOMOUS"
+                and not elevated
+                and not has_ambiguity
+                and (noul_prob is not None and noul_prob < 0.35)
+                and (score_level is None or score_level <= 1)
+                and deny_prob < 0.10
+            ):
                 policy = "ALLOW_AUTONOMOUS"
             else:
                 policy = "REQUIRE_HUMAN_APPROVAL"
@@ -1778,6 +2000,8 @@ class ToolRegistry:
                     "policy": policy,
                     "is_destructive_probability": round(noul_prob, 4) if noul_prob is not None else 0.0,
                     "raw_choice": raw_choice,
+                    "top_choice": top_choice,
+                    "risk_score_level": score_level,
                     "ambiguity_detected": has_ambiguity,
                     "requires_human": policy != "ALLOW_AUTONOMOUS",
                 },
@@ -1809,8 +2033,8 @@ class ToolRegistry:
             if not isinstance(patch_content, str) or not patch_content.strip():
                 raise ValueError("Argument 'patch_content' must be a non-empty string")
 
-            target_file = arguments["target_file"]
-            if not isinstance(target_file, str) or not target_file.strip():
+            target_file = str(arguments["target_file"]).strip()
+            if not target_file:
                 raise ValueError("Argument 'target_file' must be a non-empty string")
 
             risk_tolerance = str(arguments.get("risk_tolerance", "balanced")).strip().lower()
@@ -1818,12 +2042,12 @@ class ToolRegistry:
                 raise ValueError("Argument 'risk_tolerance' must be one of: strict, balanced, permissive")
 
             mock_answers = arguments.get("mock_answers")
-            timeout = float(arguments.get("timeout", 30.0))
-            bypass_cache = bool(arguments.get("bypass_cache", True))
+            timeout = max(1.0, min(self._sanitize_float(arguments.get("timeout", 30.0), "timeout"), 60.0))
+            bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", True), "bypass_cache")
 
             state = {
                 "patch_content": patch_content,
-                "target_file": target_file.strip(),
+                "target_file": target_file,
                 "risk_tolerance": risk_tolerance,
             }
 
@@ -1900,24 +2124,62 @@ class ToolRegistry:
 
             choice_item = answers.get("recommendation", {})
             raw_rec = choice_item.get("choice")
+            top_rec = choice_item.get("calibration", {}).get("top_choice")
+            reject_prob = choice_item.get("probabilities", {}).get("REJECT", 0.0)
+            try:
+                reject_prob = float(reject_prob)
+            except (ValueError, TypeError):
+                reject_prob = 0.0
 
-            if raw_rec == "REJECT" or (noul_prob is not None and noul_prob >= 0.70):
+            # Inspect risk_score
+            score_item = answers.get("risk_score", {})
+            raw_score = score_item.get("score")
+            score_level: Optional[int] = None
+            if raw_score is not None:
+                try:
+                    score_level = int(raw_score)
+                except (ValueError, TypeError):
+                    score_str = str(raw_score).lower()
+                    if "critical" in score_str:
+                        score_level = 4
+                    elif "high" in score_str:
+                        score_level = 3
+                    elif "moderate" in score_str:
+                        score_level = 2
+                    elif "low" in score_str:
+                        score_level = 1
+                    elif "clean" in score_str or "safe" in score_str:
+                        score_level = 0
+
+            if raw_rec == "REJECT" or (noul_prob is not None and noul_prob >= 0.70) or score_level == 4:
                 rec = "REJECT"
                 approved = False
-                risk_level = "CRITICAL" if (noul_prob and noul_prob >= 0.85) else "HIGH"
-            elif has_ambiguity or noul_prob is None or raw_rec != "APPROVE":
+                risk_level = "CRITICAL" if ((noul_prob and noul_prob >= 0.85) or score_level == 4) else "HIGH"
+            elif (
+                has_ambiguity
+                or noul_prob is None
+                or raw_rec != "APPROVE"
+                or top_rec != "APPROVE"
+                or reject_prob >= 0.15
+                or (score_level is not None and score_level >= 2)
+            ):
+                rec = "REQUEST_CHANGES"
+                approved = False
+                if score_level == 3 or (noul_prob and noul_prob >= 0.50):
+                    risk_level = "HIGH"
+                elif score_level == 2 or (noul_prob and noul_prob >= 0.30):
+                    risk_level = "MEDIUM"
+                else:
+                    risk_level = "LOW"
+            elif risk_tolerance == "strict" and (noul_prob is not None and noul_prob >= 0.20):
                 rec = "REQUEST_CHANGES"
                 approved = False
                 risk_level = "MEDIUM"
-            elif risk_tolerance == "strict" and noul_prob >= 0.20:
+            elif risk_tolerance == "balanced" and (noul_prob is not None and noul_prob >= 0.40):
                 rec = "REQUEST_CHANGES"
                 approved = False
                 risk_level = "MEDIUM"
-            elif risk_tolerance == "balanced" and noul_prob >= 0.40:
-                rec = "REQUEST_CHANGES"
-                approved = False
-                risk_level = "MEDIUM"
-            elif risk_tolerance == "permissive" and noul_prob >= 0.60:
+            elif risk_tolerance == "permissive" and (noul_prob is not None and noul_prob >= 0.60):
                 rec = "REQUEST_CHANGES"
                 approved = False
                 risk_level = "MEDIUM"
@@ -1939,6 +2201,8 @@ class ToolRegistry:
                     "risk_level": risk_level,
                     "regression_probability": round(noul_prob, 4) if noul_prob is not None else 0.0,
                     "raw_choice": raw_rec,
+                    "top_choice": top_rec,
+                    "risk_score_level": score_level,
                     "ambiguity_detected": has_ambiguity,
                 },
                 "calibration": calib,
@@ -1983,13 +2247,10 @@ class ToolRegistry:
             if len(options) < 1:
                 raise ValueError("Argument 'options' must contain at least one option")
 
-            mock_answers = (
-                arguments.get("mock_answers")
-                if (self.allow_test_mocks or os.environ.get("JEVGUARD_TEST_MODE") == "1")
-                else None
-            )
-            timeout = float(arguments.get("timeout", 30.0))
-            bypass_cache = bool(arguments.get("bypass_cache", False))
+            is_test = self.allow_test_mocks
+            mock_answers = arguments.get("mock_answers") if is_test else None
+            timeout = max(1.0, min(self._sanitize_float(arguments.get("timeout", 30.0), "timeout"), 60.0))
+            bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", False), "bypass_cache")
 
             state = {
                 "context": context.strip(),
@@ -2032,12 +2293,42 @@ class ToolRegistry:
                 }
 
             answers = eval_res.get("answers", {})
-            decision_ans = answers.get("decision", {})
+            decision_ans = answers.get("decision")
+            if not decision_ans or not isinstance(decision_ans, dict):
+                return {
+                    "status": "error",
+                    "success": False,
+                    "error_type": "EvaluationIncompleteError",
+                    "message": "Upstream evaluation did not return an answer for 'decision'",
+                    "verdict": "MANUAL_REVIEW_REQUIRED",
+                    "fallback_action": "MANUAL_REVIEW_REQUIRED",
+                    "decision_question": decision_question,
+                    "options": options,
+                    "selected_option": None,
+                    "is_ambiguous": True,
+                    "status": "AMBIGUOUS_STATE",
+                }
+
             selected_choice = decision_ans.get("choice")
             confidence = decision_ans.get("confidence", 0.0)
             is_ambiguous = decision_ans.get("is_ambiguous", False)
             status = decision_ans.get("status", "CONFIDENT")
-            is_escape = selected_choice == ESCAPE_OPTION_KEY
+
+            is_escape = False
+            if selected_choice is not None and str(selected_choice).strip():
+                sel_clean = str(selected_choice).strip()
+                if sel_clean == ESCAPE_OPTION_KEY or sel_clean.lower() in ESCAPE_CANDIDATE_KEYS:
+                    is_escape = True
+                    selected_choice = ESCAPE_OPTION_KEY
+                elif sel_clean not in options:
+                    is_ambiguous = True
+                    status = "AMBIGUOUS_STATE"
+                    reasons = decision_ans.setdefault("calibration", {}).setdefault("reasons", [])
+                    reasons.append("unrecognized_selected_option")
+            else:
+                is_ambiguous = True
+                status = "AMBIGUOUS_STATE"
+                selected_choice = None
 
             return {
                 "success": True,
@@ -2075,7 +2366,7 @@ class ToolRegistry:
         max_retries: int = 3,
         initial_backoff: float = 0.5,
     ) -> Dict[str, Any]:
-        canonical_endpoint = str(endpoint).strip()
+        canonical_endpoint = endpoint.strip()
         if not is_authorized_endpoint(canonical_endpoint):
             raise PermissionError(
                 f"Endpoint '{canonical_endpoint}' is not permitted. Only official TypeSafe AI endpoints or JEVGUARD_ALLOWED_ENDPOINTS are authorized."
@@ -2085,9 +2376,10 @@ class ToolRegistry:
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json; charset=utf-8",
-            "User-Agent": "JevGuard-MCP/1.0",
+            "User-Agent": "JevGuard-MCP/1.0.2",
         }
 
+        MAX_RESPONSE_BYTES = 10 * 1024 * 1024
         attempts = 0
         max_attempts = max(1, max_retries + 1)
         opener = urllib.request.build_opener(NoRedirectHandler())
@@ -2099,31 +2391,39 @@ class ToolRegistry:
 
             try:
                 with opener.open(req, timeout=timeout) as resp:
+                    status_code = resp.getcode() if hasattr(resp, "getcode") else 200
+                    try:
+                        body_bytes = resp.read(MAX_RESPONSE_BYTES)
+                    except TypeError:
+                        body_bytes = resp.read()
                     t1 = time.perf_counter()
                     latency_ms = round((t1 - t0) * 1000, 3)
-                    body = resp.read().decode("utf-8", errors="replace")
-                    data = json.loads(body) if body else {}
+                    body = body_bytes.decode("utf-8", errors="replace")
+                    try:
+                        data = json.loads(body) if body else {}
+                    except json.JSONDecodeError as json_err:
+                        raise RuntimeError(f"Invalid JSON response from upstream: {json_err}")
                     return {
                         "data": data,
                         "latency_ms": latency_ms,
-                        "status_code": resp.getcode(),
+                        "status_code": status_code,
                         "success": True,
                     }
 
             except urllib.error.HTTPError as err:
                 code = err.code
                 try:
-                    err_body = err.read().decode("utf-8", errors="replace")
+                    err_body = err.read(65536).decode("utf-8", errors="replace")
                 except Exception:
                     err_body = str(err)
-                if code in (400, 401, 403, 404):
+                if code in (400, 401, 403, 404, 422):
                     raise RuntimeError(f"HTTP {code} error from TypeSafe AI: {err_body}")
 
-                if attempts < max_attempts:
+                if code in (429, 500, 502, 503, 504) and attempts < max_attempts:
                     delay = initial_backoff * (2 ** (attempts - 1)) + random.uniform(0.05, 0.25)
                     time.sleep(delay)
                     continue
-                raise RuntimeError(f"HTTP {code} failure after retries: {err_body}")
+                raise RuntimeError(f"HTTP {code} failure: {err_body}")
 
             except (socket.timeout, TimeoutError) as err:
                 if attempts < max_attempts:
@@ -2133,6 +2433,8 @@ class ToolRegistry:
                 raise RuntimeError(f"Connection timeout to {endpoint}: {err}")
 
             except Exception as err:
+                if "HTTP redirect" in str(err) or isinstance(err, (ValueError, json.JSONDecodeError)):
+                    raise RuntimeError(f"Request error: {err}")
                 if attempts < max_attempts:
                     delay = initial_backoff * (2 ** (attempts - 1)) + random.uniform(0.05, 0.25)
                     time.sleep(delay)

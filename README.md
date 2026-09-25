@@ -1,7 +1,7 @@
 # JevGuard MCP Server
 
 [![PyPI version](https://img.shields.io/pypi/v/jevguard-mcp.svg)](https://pypi.org/project/jevguard-mcp/)
-[![Python 3.8+](https://img.shields.io/badge/Python-3.8+-brightgreen.svg)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10+-brightgreen.svg)](https://www.python.org/)
 [![Dependencies](https://img.shields.io/badge/Dependencies-Zero%20(stdlib%20only)-blue.svg)](https://www.python.org/)
 [![Protocol](https://img.shields.io/badge/MCP-2024--11--05-orange.svg)](https://modelcontextprotocol.io/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -107,7 +107,7 @@ All tools use the canonical `jevguard_*` prefix to guarantee naming consistency 
 | `jevguard_verify_code_patch` | `patch_content`, `target_file`, `risk_tolerance` | Audit diffs for security regressions | `APPROVE`, `REQUEST_CHANGES`, `REJECT` |
 | `jevguard_evaluate_decision` | `context`, `decision_question`, `options` | Resolve choices with neutral escape | `CONFIDENT`, `AMBIGUOUS_STATE` |
 | `jevguard_evaluate` | `state`, `questions`, `bypass_cache` | Full RLCD decision pipeline | Typed answers and calibrated probabilities |
-| `jevguard_calibrate` | `answers`, `top_prob_threshold`, `dispersion_gap` | Detect tie breaks and low margins | `AMBIGUOUS_STATE`, `CONFIDENT` |
+| `jevguard_calibrate` | `answers`, `min_top_prob`, `min_dispersion_gap` | Detect tie breaks and low margins | `AMBIGUOUS_STATE`, `CONFIDENT` |
 | `jevguard_prune_state` | `state` | Strip dead keys, format space, break cycles | Sanitized mapping and token estimate |
 | `jevguard_cache_fingerprint` | `state`, `ignore_keys` | Mask volatile timestamps and hashes | Canonical SHA-256 fingerprint string |
 
@@ -239,7 +239,7 @@ Run the unit tests with Python standard `unittest` runner:
 python -m unittest test_mcp_server.py -v
 ```
 
-All 93 test cases execute in under 0.6 seconds with zero network dependencies.
+All 112 test cases execute in under 0.6 seconds with zero network dependencies.
 
 ---
 
