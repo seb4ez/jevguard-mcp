@@ -312,6 +312,7 @@ class DeterministicCache:
             "misses": 0,
             "tokens_saved": 0,
         }
+        self._closed: bool = False
 
         try:
             if self.db_path == ":memory:":
@@ -335,6 +336,8 @@ class DeterministicCache:
 
     def _fallback_to_memory(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             self.db_path = ":memory:"
             conn = getattr(self._local, "conn", None)
             if conn is not None:
@@ -354,8 +357,12 @@ class DeterministicCache:
 
     @contextlib.contextmanager
     def _get_connection(self):
+        if self._closed:
+            raise RuntimeError("DeterministicCache is closed.")
         if self.db_path == ":memory:":
             with self._lock:
+                if self._closed:
+                    raise RuntimeError("DeterministicCache is closed.")
                 if self._shared_conn is None:
                     self._shared_conn = sqlite3.connect(":memory:", check_same_thread=False, timeout=60.0)
                     self._shared_conn.row_factory = sqlite3.Row
@@ -515,6 +522,8 @@ class DeterministicCache:
         return hashlib.sha256(canonical_bytes).hexdigest()
 
     def get(self, fingerprint: str) -> Optional[Dict[str, Any]]:
+        if self._closed:
+            return None
         with self._lock:
             if self.ttl_seconds <= 0:
                 return None
@@ -538,7 +547,14 @@ class DeterministicCache:
                 )
                 row = cur.fetchone()
                 if row:
-                    entry_created_at = row["created_at"]
+                    raw_created_at = row["created_at"]
+                    try:
+                        entry_created_at = float(raw_created_at)
+                    except (ValueError, TypeError):
+                        conn.execute("DELETE FROM evaluation_cache WHERE fingerprint = ?", (fingerprint,))
+                        conn.commit()
+                        return None
+
                     if self.ttl_seconds > 0 and (time.time() - entry_created_at) > self.ttl_seconds:
                         conn.execute("DELETE FROM evaluation_cache WHERE fingerprint = ?", (fingerprint,))
                         conn.commit()
@@ -550,15 +566,26 @@ class DeterministicCache:
                             conn.commit()
                             return None
 
-                        tokens = row["tokens_estimate"]
+                        if not isinstance(data, dict):
+                            conn.execute("DELETE FROM evaluation_cache WHERE fingerprint = ?", (fingerprint,))
+                            conn.commit()
+                            return None
+
+                        raw_tokens = row["tokens_estimate"]
+                        try:
+                            tokens = int(raw_tokens)
+                        except (ValueError, TypeError):
+                            tokens = 0
+
                         with self._lock:
                             self.stats["hits"] += 1
                             self.stats["tokens_saved"] += tokens
                             self._promote_lru(fingerprint, data, tokens, created_at=entry_created_at)
                         return copy.deepcopy(data)
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
-            logger.warning("Cache lookup database error for %s: %s. Falling back to :memory:.", fingerprint, err)
-            self._fallback_to_memory()
+            if not self._closed:
+                logger.warning("Cache lookup database error for %s: %s. Falling back to :memory:.", fingerprint, err)
+                self._fallback_to_memory()
         except Exception as err:
             logger.warning("Cache lookup error for %s: %s", fingerprint, err)
 
@@ -573,7 +600,7 @@ class DeterministicCache:
         response_data: Dict[str, Any],
         input_tokens_estimate: int = 0,
     ) -> None:
-        if self.ttl_seconds <= 0:
+        if self._closed or self.ttl_seconds <= 0:
             return
 
         now = time.time()
@@ -607,8 +634,9 @@ class DeterministicCache:
                         del self._memory_lru[k]
                 self._promote_lru(fingerprint, data_to_store, input_tokens_estimate, created_at=now)
         except (sqlite3.OperationalError, sqlite3.DatabaseError) as err:
-            logger.warning("Cache put database error for %s: %s. Falling back to :memory:.", fingerprint, err)
-            self._fallback_to_memory()
+            if not self._closed:
+                logger.warning("Cache put database error for %s: %s. Falling back to :memory:.", fingerprint, err)
+                self._fallback_to_memory()
             with self._lock:
                 self._promote_lru(fingerprint, data_to_store, input_tokens_estimate, created_at=now)
         except Exception as err:
@@ -645,6 +673,8 @@ class DeterministicCache:
         }
 
     def clear(self) -> None:
+        if self._closed:
+            return
         with self._lock:
             self._memory_lru.clear()
             self.stats = {"hits": 0, "misses": 0, "tokens_saved": 0}
@@ -661,6 +691,7 @@ class DeterministicCache:
 
     def close(self) -> None:
         with self._lock:
+            self._closed = True
             self._memory_lru.clear()
             for conn in list(self._all_conns):
                 try:
@@ -1145,7 +1176,7 @@ class QuestionOptimizer:
         injected_escape = False
         if wire_dict["type"] == "choice" and auto_inject_escapes and allow_escape:
             curr_criteria = dict(wire_dict["criteria"])
-            has_escape = any(k.strip().lower() in ESCAPE_CANDIDATE_KEYS for k in curr_criteria.keys())
+            has_escape = any(k.strip().upper() == ESCAPE_OPTION_KEY for k in curr_criteria.keys())
             if not has_escape:
                 curr_criteria[ESCAPE_OPTION_KEY] = ESCAPE_OPTION_DESC
                 injected_escape = True
@@ -1248,8 +1279,8 @@ class ToolRegistry:
                         },
                         "timeout": {
                             "type": "number",
-                            "description": "HTTP request timeout in seconds (default: 30.0, max: 60.0).",
-                            "default": 30.0,
+                            "description": "Upstream evaluation timeout in seconds (0.1 to 300.0).",
+                            "default": 10.0,
                         },
                         "ignore_keys": {
                             "type": "array",
@@ -1561,7 +1592,17 @@ class ToolRegistry:
                     }
 
         # Strictly validate and sanitize argument types
-        sanitized_args = self._validate_and_sanitize_arguments(name, arguments)
+        try:
+            sanitized_args = self._validate_and_sanitize_arguments(name, arguments)
+        except (ValueError, TypeError) as err:
+            return {
+                "status": "error",
+                "success": False,
+                "error_type": "ValidationError",
+                "message": str(err),
+                "verdict": "MANUAL_REVIEW_REQUIRED",
+                "fallback_action": "MANUAL_REVIEW_REQUIRED",
+            }
 
         handler = handler_map[name]
         try:
@@ -1673,10 +1714,9 @@ class ToolRegistry:
 
             wire_questions = questions
             if isinstance(questions, (dict, list)) and questions:
-                try:
-                    wire_questions, _ = self.optimizer.normalize_questions(questions, auto_inject_escapes=auto_inject)
-                except Exception:
-                    wire_questions = questions
+                wire_questions, _ = self.optimizer.normalize_questions(questions, auto_inject_escapes=auto_inject)
+            else:
+                wire_questions = questions if isinstance(questions, dict) else {}
 
             # Prune state identically to evaluate so fingerprint matches live evaluation
             pruned_state = StatePruner.prune(state, collapse_whitespace=collapse_whitespace)
@@ -1685,23 +1725,23 @@ class ToolRegistry:
             api_key = str(os.environ.get("TYPESAFE_API_KEY", "")).strip()
             tenant_id = hashlib.sha256(api_key.encode()).hexdigest()[:16] if api_key else None
 
+            effective_ignore_keys = (
+                set(self.cache.default_ignore_keys).union({str(k).strip().lower().replace("-", "_") for k in ignore_keys})
+                if ignore_keys is not None
+                else set(self.cache.default_ignore_keys)
+            )
+
             fp = DeterministicCache.compute_fingerprint(
                 model=model,
                 state=pruned_state,
                 wire_questions=wire_questions if isinstance(wire_questions, dict) else {},
-                ignore_keys=ignore_keys,
+                ignore_keys=effective_ignore_keys,
                 endpoint=endpoint,
                 tenant_id=tenant_id,
                 runtime_version="1.1.0",
             )
 
-            keys_used = sorted(
-                list(
-                    {str(k).strip().lower().replace("-", "_") for k in ignore_keys}
-                    if ignore_keys is not None
-                    else DEFAULT_VOLATILE_KEYS
-                )
-            )
+            keys_used = sorted(list(effective_ignore_keys))
 
             return {
                 "success": True,
@@ -1743,7 +1783,6 @@ class ToolRegistry:
             return {
                 "success": True,
                 "answers": calibrated,
-                "calibrated_answers": calibrated,
                 "calibration_summary": summary,
                 "summary": summary,
                 "is_ambiguous": summary["has_ambiguity"],
@@ -1772,7 +1811,7 @@ class ToolRegistry:
             model = str(arguments.get("model", "jev-latest")).strip() or "jev-latest"
             auto_inject = self._sanitize_bool(arguments.get("auto_inject_escapes", True), "auto_inject_escapes")
             bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", False), "bypass_cache")
-            timeout = max(1.0, min(self._sanitize_float(arguments.get("timeout", 30.0), "timeout"), 60.0))
+            timeout = max(0.1, min(self._sanitize_float(arguments.get("timeout", 10.0), "timeout", min_val=0.1, max_val=300.0), 300.0))
             ignore_keys = arguments.get("ignore_keys")
 
             api_key = str(os.environ.get("TYPESAFE_API_KEY", "")).strip()
@@ -1803,11 +1842,16 @@ class ToolRegistry:
             tokens_estimate = opt_metadata["estimated_tokens"]
 
             tenant_id = hashlib.sha256(api_key.encode()).hexdigest()[:16] if api_key else None
+            effective_ignore_keys = (
+                set(self.cache.default_ignore_keys).union({str(k).strip().lower().replace("-", "_") for k in ignore_keys})
+                if ignore_keys is not None
+                else set(self.cache.default_ignore_keys)
+            )
             fingerprint = DeterministicCache.compute_fingerprint(
                 model=wire_payload["model"],
                 state=wire_payload["state"],
                 wire_questions=wire_payload["questions"],
-                ignore_keys=ignore_keys,
+                ignore_keys=effective_ignore_keys,
                 endpoint=endpoint,
                 tenant_id=tenant_id,
                 runtime_version="1.1.0",
@@ -1821,7 +1865,6 @@ class ToolRegistry:
                     ans_val = cached_data["answers"]
                     return {
                         "answers": ans_val,
-                        "calibrated_answers": ans_val,
                         "cache_fingerprint": fingerprint,
                         "cached": True,
                         "calibration": cached_data["calibration"],
@@ -1906,7 +1949,6 @@ class ToolRegistry:
 
             return {
                 "answers": calibrated_answers,
-                "calibrated_answers": calibrated_answers,
                 "cache_fingerprint": fingerprint,
                 "cached": False,
                 "calibration": calib_summary,
@@ -1944,7 +1986,7 @@ class ToolRegistry:
             working_dir = str(arguments.get("working_dir", "")).strip()
             elevated = self._sanitize_bool(arguments.get("elevated_privileges", False), "elevated_privileges")
             mock_answers = arguments.get("mock_answers")
-            timeout = max(1.0, min(self._sanitize_float(arguments.get("timeout", 30.0), "timeout"), 60.0))
+            timeout = max(0.1, min(self._sanitize_float(arguments.get("timeout", 10.0), "timeout", min_val=0.1, max_val=300.0), 300.0))
             bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", False), "bypass_cache")
 
             state = {
@@ -2128,8 +2170,8 @@ class ToolRegistry:
                 raise ValueError("Argument 'risk_tolerance' must be one of: strict, balanced, permissive")
 
             mock_answers = arguments.get("mock_answers")
-            timeout = max(1.0, min(self._sanitize_float(arguments.get("timeout", 30.0), "timeout"), 60.0))
-            bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", True), "bypass_cache")
+            timeout = max(0.1, min(self._sanitize_float(arguments.get("timeout", 10.0), "timeout", min_val=0.1, max_val=300.0), 300.0))
+            bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", False), "bypass_cache")
 
             state = {
                 "patch_content": patch_content,
@@ -2269,12 +2311,10 @@ class ToolRegistry:
             else:
                 rec = "REQUEST_CHANGES"
                 approved = False
-                if score_level == 3 or (noul_prob and noul_prob >= 0.50):
+                if score_level == 3 or (noul_prob is not None and noul_prob >= 0.50):
                     risk_level = "HIGH"
-                elif score_level == 2 or (noul_prob and noul_prob >= 0.30):
-                    risk_level = "MEDIUM"
                 else:
-                    risk_level = "MEDIUM" if score_level == 4 else "LOW"
+                    risk_level = "MEDIUM"
 
             return {
                 "success": True,
@@ -2337,7 +2377,7 @@ class ToolRegistry:
 
             is_test = self.allow_test_mocks
             mock_answers = arguments.get("mock_answers") if is_test else None
-            timeout = max(1.0, min(self._sanitize_float(arguments.get("timeout", 30.0), "timeout"), 60.0))
+            timeout = max(0.1, min(self._sanitize_float(arguments.get("timeout", 10.0), "timeout", min_val=0.1, max_val=300.0), 300.0))
             bypass_cache = self._sanitize_bool(arguments.get("bypass_cache", False), "bypass_cache")
 
             state = {
@@ -2403,15 +2443,14 @@ class ToolRegistry:
             status = decision_ans.get("status", "CONFIDENT")
 
             is_escape = False
+            user_options_map = {opt.lower(): opt for opt in options}
             if selected_choice is not None and str(selected_choice).strip():
                 sel_clean = str(selected_choice).strip()
-                if sel_clean == ESCAPE_OPTION_KEY:
-                    is_escape = True
-                    selected_choice = ESCAPE_OPTION_KEY
-                elif sel_clean in options:
+                opt_match = user_options_map.get(sel_clean.lower())
+                if opt_match is not None:
                     is_escape = False
-                    selected_choice = sel_clean
-                elif sel_clean.lower() in ESCAPE_CANDIDATE_KEYS:
+                    selected_choice = opt_match
+                elif sel_clean == ESCAPE_OPTION_KEY or sel_clean.lower() in ESCAPE_CANDIDATE_KEYS:
                     is_escape = True
                     selected_choice = ESCAPE_OPTION_KEY
                 else:

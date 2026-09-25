@@ -2281,14 +2281,14 @@ class TestAuditFindingsHardened(unittest.TestCase):
             {
                 "command": "systemctl restart service",
                 "mock_answers": {
-                    "safety": {
+                    "execution_policy": {
                         "type": "choice",
                         "choice": "ALLOW_AUTONOMOUS",
                         "confidence": 0.95,
                         "probabilities": {"ALLOW_AUTONOMOUS": 0.95, "REQUIRE_HUMAN_APPROVAL": 0.05},
                     },
                     "risk_score": {"type": "score", "score": -1, "confidence": 0.9},
-                    "boundary_check": {"type": "noul", "noul": 0.1, "confidence": 0.9},
+                    "is_destructive": {"type": "noul", "noul": 0.1, "confidence": 0.9},
                 },
             },
         )
@@ -2301,14 +2301,14 @@ class TestAuditFindingsHardened(unittest.TestCase):
             {
                 "command": "echo test",
                 "mock_answers": {
-                    "safety": {
+                    "execution_policy": {
                         "type": "choice",
                         "choice": "ALLOW_AUTONOMOUS",
                         "confidence": 0.95,
                         "probabilities": {"ALLOW_AUTONOMOUS": 0.95, "REQUIRE_HUMAN_APPROVAL": 0.05},
                     },
                     "risk_score": {"type": "score", "score": "unparseable_score_blob", "confidence": 0.9},
-                    "boundary_check": {"type": "noul", "noul": 0.1, "confidence": 0.9},
+                    "is_destructive": {"type": "noul", "noul": 0.1, "confidence": 0.9},
                 },
             },
         )
@@ -2327,8 +2327,8 @@ class TestAuditFindingsHardened(unittest.TestCase):
                         "confidence": 0.95,
                         "probabilities": {"APPROVE": 0.95, "REJECT": 0.05},
                     },
-                    "patch_risk_score": {"type": "score", "score": -1, "confidence": 0.9},
-                    "safety_boundary": {"type": "noul", "noul": 0.1, "confidence": 0.9},
+                    "risk_score": {"type": "score", "score": -1, "confidence": 0.9},
+                    "has_regression": {"type": "noul", "noul": 0.1, "confidence": 0.9},
                 },
             },
         )
@@ -2412,6 +2412,364 @@ class TestAuditFindingsHardened(unittest.TestCase):
         cal, summary = calibrator.calibrate(raw)
         self.assertTrue(summary["has_ambiguity"])
         self.assertIn("invalid_probability_sum", summary["reasons"])
+
+
+class TestAdversarialCritiqueAndHardeningFixes(unittest.TestCase):
+    """Rigorous adversarial tests validating all 10 critique points and open points."""
+
+    def setUp(self):
+        self.server = MCPServer(cache_db_path=":memory:", allow_test_mocks=True, initialized=True)
+
+    def test_verify_code_patch_risk_level_request_changes(self):
+        # Case A: score_level == 3 -> HIGH
+        res_score3 = self.server.registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "+def foo_score3(): pass",
+                "target_file": "foo.py",
+                "risk_tolerance": "balanced",
+                "mock_answers": {
+                    "recommendation": {"type": "choice", "choice": "APPROVE", "confidence": 0.95},
+                    "risk_score": {"type": "score", "score": 3, "confidence": 0.95},
+                    "has_regression": {"type": "noul", "noul": 0.05, "confidence": 0.95},
+                },
+            },
+        )
+        self.assertEqual(res_score3["recommendation"], "REQUEST_CHANGES")
+        self.assertEqual(res_score3["risk_level"], "HIGH")
+
+        # Case B: noul_prob >= 0.50 -> HIGH
+        res_noul_high = self.server.registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "+def foo_noul_high(): pass",
+                "target_file": "foo.py",
+                "risk_tolerance": "balanced",
+                "mock_answers": {
+                    "recommendation": {"type": "choice", "choice": "APPROVE", "confidence": 0.95},
+                    "risk_score": {"type": "score", "score": 1, "confidence": 0.95},
+                    "has_regression": {"type": "noul", "noul": 0.55, "confidence": 0.95},
+                },
+            },
+        )
+        self.assertEqual(res_noul_high["recommendation"], "REQUEST_CHANGES")
+        self.assertEqual(res_noul_high["risk_level"], "HIGH")
+
+        # Case C: tolerance strict triggers REQUEST_CHANGES (noul >= 0.20) -> MEDIUM
+        res_tol_strict = self.server.registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "+def foo_strict(): pass",
+                "target_file": "foo.py",
+                "risk_tolerance": "strict",
+                "mock_answers": {
+                    "recommendation": {"type": "choice", "choice": "APPROVE", "confidence": 0.95},
+                    "risk_score": {"type": "score", "score": 1, "confidence": 0.95},
+                    "has_regression": {"type": "noul", "noul": 0.25, "confidence": 0.95},
+                },
+            },
+        )
+        self.assertEqual(res_tol_strict["recommendation"], "REQUEST_CHANGES")
+        self.assertEqual(res_tol_strict["risk_level"], "MEDIUM")
+
+        # Case D: score_level == 2 -> MEDIUM
+        res_score2 = self.server.registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "+def foo_score2(): pass",
+                "target_file": "foo.py",
+                "risk_tolerance": "permissive",
+                "mock_answers": {
+                    "recommendation": {"type": "choice", "choice": "APPROVE", "confidence": 0.95},
+                    "risk_score": {"type": "score", "score": 2, "confidence": 0.95},
+                    "has_regression": {"type": "noul", "noul": 0.05, "confidence": 0.95},
+                },
+            },
+        )
+        self.assertEqual(res_score2["recommendation"], "REQUEST_CHANGES")
+        self.assertEqual(res_score2["risk_level"], "MEDIUM")
+
+        # Case E: ambiguity triggers REQUEST_CHANGES -> MEDIUM
+        res_ambig = self.server.registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "+def foo_ambig(): pass",
+                "target_file": "foo.py",
+                "risk_tolerance": "balanced",
+                "mock_answers": {
+                    "recommendation": {
+                        "type": "choice",
+                        "choice": "APPROVE",
+                        "confidence": 0.50,
+                        "probabilities": {"APPROVE": 0.50, "REQUEST_CHANGES": 0.50},
+                    },
+                    "risk_score": {"type": "score", "score": 1, "confidence": 0.95},
+                    "has_regression": {"type": "noul", "noul": 0.05, "confidence": 0.95},
+                },
+            },
+        )
+        self.assertEqual(res_ambig["recommendation"], "REQUEST_CHANGES")
+        self.assertEqual(res_ambig["risk_level"], "MEDIUM")
+
+        # Case F: Clean approval -> LOW
+        res_approve = self.server.registry.execute_tool(
+            "verify_code_patch",
+            {
+                "patch_content": "+def foo_clean(): pass",
+                "target_file": "foo.py",
+                "risk_tolerance": "balanced",
+                "mock_answers": {
+                    "recommendation": {"type": "choice", "choice": "APPROVE", "confidence": 0.95},
+                    "risk_score": {"type": "score", "score": 0, "confidence": 0.95},
+                    "has_regression": {"type": "noul", "noul": 0.05, "confidence": 0.95},
+                },
+            },
+        )
+        self.assertEqual(res_approve["recommendation"], "APPROVE")
+        self.assertTrue(res_approve["approved"])
+        self.assertEqual(res_approve["risk_level"], "LOW")
+
+    def test_unification_validations_execute_tool_and_server(self):
+        # execute_tool catches validation error and returns structured dict
+        res = self.server.registry.execute_tool(
+            "jevguard_calibrate",
+            {"answers": {}, "min_top_prob": 2.5},
+        )
+        self.assertFalse(res["success"])
+        self.assertEqual(res["error_type"], "ValidationError")
+        self.assertEqual(res["verdict"], "MANUAL_REVIEW_REQUIRED")
+        self.assertEqual(res["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+
+        # server.handle_message returns isError: True with structured content, not jsonrpc error
+        msg = {
+            "jsonrpc": "2.0",
+            "id": "req-1",
+            "method": "tools/call",
+            "params": {
+                "name": "jevguard_calibrate",
+                "arguments": {"answers": {}, "min_top_prob": 2.5},
+            },
+        }
+        resp = self.server.handle_message(msg)
+        self.assertNotIn("error", resp)
+        self.assertIn("result", resp)
+        self.assertTrue(resp["result"]["isError"])
+        content_json = json.loads(resp["result"]["content"][0]["text"])
+        self.assertEqual(content_json["error_type"], "ValidationError")
+        self.assertEqual(content_json["verdict"], "MANUAL_REVIEW_REQUIRED")
+        self.assertEqual(content_json["fallback_action"], "MANUAL_REVIEW_REQUIRED")
+
+        # Protocol level error: unknown tool name
+        bad_tool_msg = {
+            "jsonrpc": "2.0",
+            "id": "req-2",
+            "method": "tools/call",
+            "params": {"name": "non_existent_tool_123", "arguments": {}},
+        }
+        resp_bad_tool = self.server.handle_message(bad_tool_msg)
+        self.assertIn("error", resp_bad_tool)
+        self.assertEqual(resp_bad_tool["error"]["code"], -32601)
+
+        # Protocol level error: params is not a dict
+        bad_params_msg = {
+            "jsonrpc": "2.0",
+            "id": "req-3",
+            "method": "tools/call",
+            "params": ["not", "a", "dict"],
+        }
+        resp_bad_params = self.server.handle_message(bad_params_msg)
+        self.assertIn("error", resp_bad_params)
+        self.assertEqual(resp_bad_params["error"]["code"], -32602)
+
+    def test_sanitize_floats_extended_collections(self):
+        from jevguard_mcp.server import _sanitize_floats
+        data = {
+            "tuple": (1.0, float("nan"), float("inf"), -float("inf")),
+            "set": {1.0, float("nan")},
+            "frozenset": frozenset([float("inf"), 2.0]),
+            "nested": [
+                {"t": (float("nan"), 3.14)}
+            ]
+        }
+        cleaned = _sanitize_floats(data)
+        self.assertEqual(cleaned["tuple"], (1.0, None, None, None))
+        self.assertIn(1.0, cleaned["set"])
+        self.assertIn(None, cleaned["set"])
+        self.assertIn(2.0, cleaned["frozenset"])
+        self.assertIn(None, cleaned["frozenset"])
+        self.assertEqual(cleaned["nested"][0]["t"], (None, 3.14))
+
+    def test_smithery_yaml_configuration(self):
+        smithery_path = pathlib.Path(repo_root) / "smithery.yaml"
+        self.assertTrue(smithery_path.exists(), "smithery.yaml must exist")
+        content = smithery_path.read_text(encoding="utf-8")
+        self.assertIn('command: "pip install ."', content)
+        self.assertIn('command: "python3"', content)
+        self.assertIn("jevguard_mcp.server", content)
+
+    def test_unified_defaults_and_ranges(self):
+        definitions = {t["name"]: t for t in self.server.registry.get_definitions()}
+        for tool_name in ["jevguard_evaluate", "jevguard_evaluate_command_safety", "jevguard_verify_code_patch", "jevguard_evaluate_decision"]:
+            schema = definitions[tool_name]["inputSchema"]["properties"]
+            self.assertIn("timeout", schema, f"Missing timeout in {tool_name}")
+            self.assertEqual(schema["timeout"]["default"], 10.0, f"Default timeout must be 10.0 in {tool_name}")
+            self.assertIn("0.1 to 300.0", schema["timeout"]["description"], f"Range 0.1 to 300.0 must be documented in {tool_name}")
+
+        patch_schema = definitions["jevguard_verify_code_patch"]["inputSchema"]["properties"]
+        self.assertEqual(patch_schema["bypass_cache"]["default"], False)
+
+    def test_evaluate_decision_other_case_insensitive_and_escape(self):
+        # Case 1: user provided "Other" option, upstream returns "other" or "OTHER"
+        res_other = self.server.registry.execute_tool(
+            "evaluate_decision",
+            {
+                "context": "Context",
+                "decision_question": "Which db?",
+                "options": ["PostgreSQL", "Other"],
+                "mock_answers": {
+                    "decision": {"type": "choice", "choice": "other", "confidence": 0.9}
+                },
+            },
+        )
+        self.assertTrue(res_other["success"])
+        self.assertFalse(res_other["is_escape_selected"])
+        self.assertEqual(res_other["selected_option"], "Other")
+
+        # Case 2: user did not provide "Other", upstream returns "other"
+        res_unresolved = self.server.registry.execute_tool(
+            "evaluate_decision",
+            {
+                "context": "Context",
+                "decision_question": "Which db?",
+                "options": ["PostgreSQL", "MySQL"],
+                "mock_answers": {
+                    "decision": {"type": "choice", "choice": "other", "confidence": 0.9}
+                },
+            },
+        )
+        self.assertTrue(res_unresolved["success"])
+        self.assertTrue(res_unresolved["is_escape_selected"])
+        self.assertEqual(res_unresolved["selected_option"], "UNRESOLVED_OR_OTHER")
+
+        # Case 3: QuestionOptimizer injects UNRESOLVED_OR_OTHER even if user has "other" in criteria
+        optimizer = QuestionOptimizer()
+        norm, inj = optimizer.normalize_questions({
+            "q1": {"type": "choice", "criteria": {"other": "User defined other option"}}
+        })
+        self.assertIn(ESCAPE_OPTION_KEY, norm["q1"]["criteria"])
+        self.assertIn("q1", inj)
+
+        # But does not double inject if UNRESOLVED_OR_OTHER is already present
+        norm2, inj2 = optimizer.normalize_questions({
+            "q2": {"type": "choice", "criteria": {ESCAPE_OPTION_KEY: "Already there"}}
+        })
+        self.assertNotIn("q2", inj2)
+
+    def test_deterministic_cache_closed_protection(self):
+        cache = DeterministicCache(db_path=":memory:")
+        self.assertFalse(cache._closed)
+        cache.close()
+        self.assertTrue(cache._closed)
+
+        # Calls on closed cache are safe no-ops
+        self.assertIsNone(cache.get("any_fp"))
+        cache.put("any_fp", "jev-latest", {"test": 1})
+        cache.clear()
+        cache._fallback_to_memory()
+        self.assertTrue(cache._closed)
+
+    def test_no_calibrated_answers_alias_duplication(self):
+        res_calib = self.server.registry.execute_tool(
+            "jevguard_calibrate",
+            {"answers": {"q1": {"type": "score", "score": 2, "confidence": 0.9}}},
+        )
+        self.assertIn("answers", res_calib)
+        self.assertNotIn("calibrated_answers", res_calib)
+
+        res_eval = self.server.registry.execute_tool(
+            "jevguard_evaluate",
+            {
+                "state": {"x": 1},
+                "questions": {"q1": {"type": "score", "instructions": "Rate x", "criteria": ["low", "high"]}},
+                "mock_answers": {"q1": {"type": "score", "score": 1, "confidence": 0.95}},
+            },
+        )
+        self.assertIn("answers", res_eval)
+        self.assertNotIn("calibrated_answers", res_eval)
+
+    def test_open_points_hardened(self):
+        # 1. ignore_keys defaults to self.cache.default_ignore_keys
+        custom_cache = DeterministicCache(db_path=":memory:", default_ignore_keys=["custom_volatile_key"])
+        registry = ToolRegistry(cache_db_path=":memory:", allow_test_mocks=True)
+        registry.cache = custom_cache
+
+        fp_tool_res = registry.execute_tool("jevguard_cache_fingerprint", {"state": {"custom_volatile_key": 1, "a": 2}})
+        self.assertIn("custom_volatile_key", fp_tool_res["masked_volatile_keys"])
+
+        # 2. id validation in server
+        # Rejected (dict/list)
+        resp_dict_id = self.server.handle_message({"jsonrpc": "2.0", "id": {"bad": "id"}, "method": "ping"})
+        self.assertEqual(resp_dict_id["error"]["code"], -32600)
+        self.assertIsNone(resp_dict_id["id"])
+
+        resp_list_id = self.server.handle_message({"jsonrpc": "2.0", "id": [1, 2], "method": "ping"})
+        self.assertEqual(resp_list_id["error"]["code"], -32600)
+        self.assertIsNone(resp_list_id["id"])
+
+        # Accepted
+        resp_str_id = self.server.handle_message({"jsonrpc": "2.0", "id": "req-str", "method": "ping"})
+        self.assertEqual(resp_str_id["id"], "req-str")
+
+        resp_int_id = self.server.handle_message({"jsonrpc": "2.0", "id": 42, "method": "ping"})
+        self.assertEqual(resp_int_id["id"], 42)
+
+        resp_none_id = self.server.handle_message({"jsonrpc": "2.0", "id": None, "method": "ping"})
+        self.assertEqual(resp_none_id["id"], None)
+
+        # 3. Notification with id responds with result: {}
+        resp_notif_with_id = self.server.handle_message({"jsonrpc": "2.0", "id": 555, "method": "notifications/initialized"})
+        self.assertIsNotNone(resp_notif_with_id)
+        self.assertEqual(resp_notif_with_id["id"], 555)
+        self.assertEqual(resp_notif_with_id["result"], {})
+
+        resp_cancel_with_id = self.server.handle_message({"jsonrpc": "2.0", "id": 556, "method": "notifications/cancelled"})
+        self.assertIsNotNone(resp_cancel_with_id)
+        self.assertEqual(resp_cancel_with_id["id"], 556)
+        self.assertEqual(resp_cancel_with_id["result"], {})
+
+        # True notification without id returns None
+        resp_true_notif = self.server.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        self.assertIsNone(resp_true_notif)
+
+        # 4. DeterministicCache.get() validates dict and types
+        cache = DeterministicCache(db_path=":memory:")
+        with cache._get_connection() as conn:
+            # Corrupted response_json (list instead of dict)
+            conn.execute(
+                "INSERT INTO evaluation_cache (fingerprint, model, response_json, created_at, tokens_estimate) "
+                "VALUES ('corrupt1', 'jev-latest', '[\"not\", \"dict\"]', ?, 10)",
+                (time.time(),),
+            )
+            # Corrupted created_at (string instead of float)
+            conn.execute(
+                "INSERT INTO evaluation_cache (fingerprint, model, response_json, created_at, tokens_estimate) "
+                "VALUES ('corrupt2', 'jev-latest', '{\"ok\": 1}', 'invalid_time', 10)",
+            )
+            conn.commit()
+
+        self.assertIsNone(cache.get("corrupt1"))
+        self.assertIsNone(cache.get("corrupt2"))
+
+        # 5. _tool_cache_fingerprint does not silence normalize_questions exceptions
+        bad_fp_res = self.server.registry.execute_tool(
+            "jevguard_cache_fingerprint",
+            {
+                "state": {"x": 1},
+                "questions": {"q1": {"no_type_field": "invalid"}},
+            },
+        )
+        self.assertFalse(bad_fp_res["success"])
+        self.assertEqual(bad_fp_res["error_type"], "ValueError")
 
 
 if __name__ == "__main__":

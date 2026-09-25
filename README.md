@@ -239,7 +239,7 @@ Run the unit tests with Python standard `unittest` runner:
 python -m unittest test_mcp_server.py -v
 ```
 
-All 120 test cases execute in under 0.6 seconds with zero network dependencies.
+All 129 test cases execute in under 0.6 seconds with zero network dependencies.
 
 ---
 

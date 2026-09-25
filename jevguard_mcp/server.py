@@ -40,6 +40,12 @@ def _sanitize_floats(obj: Any) -> Any:
         return {k: _sanitize_floats(v) for k, v in obj.items()}
     elif isinstance(obj, list):
         return [_sanitize_floats(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(_sanitize_floats(item) for item in obj)
+    elif isinstance(obj, set):
+        return {_sanitize_floats(item) for item in obj}
+    elif isinstance(obj, frozenset):
+        return frozenset(_sanitize_floats(item) for item in obj)
     return obj
 
 
@@ -99,10 +105,22 @@ class MCPServer:
     def handle_message(self, message: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Handles a parsed JSON-RPC 2.0 message."""
         with self._lock:
+            has_id = "id" in message
+            msg_id = message.get("id")
+            if has_id and not (msg_id is None or isinstance(msg_id, (str, int, float))):
+                return {
+                    "jsonrpc": "2.0",
+                    "id": None,
+                    "error": {
+                        "code": -32600,
+                        "message": "Invalid Request: 'id' must be a string, number, or null",
+                    },
+                }
+
             if message.get("jsonrpc") != "2.0":
                 return {
                     "jsonrpc": "2.0",
-                    "id": message.get("id"),
+                    "id": msg_id,
                     "error": {
                         "code": -32600,
                         "message": "Invalid Request: missing or invalid 'jsonrpc' field",
@@ -110,8 +128,6 @@ class MCPServer:
                 }
 
             method = message.get("method")
-            has_id = "id" in message
-            msg_id = message.get("id")
             is_notification = not has_id
 
             if not isinstance(method, str):
@@ -152,15 +168,27 @@ class MCPServer:
                     },
                 }
 
-            # Handle notifications (no response permitted)
+            # Handle notifications
             if method in ("notifications/initialized", "initialized"):
                 if self._initialize_received:
                     self.initialized = True
                 else:
                     logger.warning("Received 'notifications/initialized' before 'initialize' request was completed.")
+                if has_id:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {},
+                    }
                 return None
 
             if method in ("notifications/cancelled", "cancelled"):
+                if has_id:
+                    return {
+                        "jsonrpc": "2.0",
+                        "id": msg_id,
+                        "result": {},
+                    }
                 return None
 
             if is_notification:
@@ -300,18 +328,19 @@ class MCPServer:
 
         try:
             result_data = self.registry.execute_tool(name, arguments)
-            if not result_data.get("success", True) and result_data.get("error_type") == "ValidationError":
+            clean_result_data = _sanitize_floats(result_data)
+            try:
+                result_text = json.dumps(clean_result_data, indent=2, sort_keys=True, allow_nan=False, default=str)
+            except Exception as ser_err:
+                logger.error("Failed to serialize tool result for '%s': %s", name, ser_err, exc_info=True)
                 return {
                     "jsonrpc": "2.0",
                     "id": msg_id,
                     "error": {
-                        "code": -32602,
-                        "message": f"Invalid params: {result_data.get('message')}",
+                        "code": -32603,
+                        "message": f"Internal JSON serialization error: {ser_err}",
                     },
                 }
-
-            clean_result_data = _sanitize_floats(result_data)
-            result_text = json.dumps(clean_result_data, indent=2, sort_keys=True, allow_nan=False, default=str)
             is_error = not result_data.get("success", True) or result_data.get("status") == "error"
             return {
                 "jsonrpc": "2.0",
@@ -333,15 +362,6 @@ class MCPServer:
                 "error": {
                     "code": -32601,
                     "message": f"Method not found / Unknown tool: '{name}' ({err})",
-                },
-            }
-        except (ValueError, TypeError) as err:
-            return {
-                "jsonrpc": "2.0",
-                "id": msg_id,
-                "error": {
-                    "code": -32602,
-                    "message": f"Invalid params: {err}",
                 },
             }
         except Exception as err:
@@ -399,8 +419,9 @@ class MCPServer:
                     if not self.running:
                         break
 
+                MAX_LINE_BYTES = 10 * 1024 * 1024
                 try:
-                    line = input_stream.readline()
+                    line = input_stream.readline(MAX_LINE_BYTES + 1)
                 except (EOFError, KeyboardInterrupt):
                     break
                 except (BrokenPipeError, ConnectionResetError):
@@ -412,8 +433,12 @@ class MCPServer:
                 if not line:
                     break
 
-                MAX_LINE_BYTES = 10 * 1024 * 1024
                 if len(line) > MAX_LINE_BYTES:
+                    if not line.endswith("\n"):
+                        while True:
+                            chunk = input_stream.readline(MAX_LINE_BYTES)
+                            if not chunk or chunk.endswith("\n"):
+                                break
                     err_resp = {
                         "jsonrpc": "2.0",
                         "id": None,
@@ -422,9 +447,13 @@ class MCPServer:
                             "message": f"Parse error: input line exceeded {MAX_LINE_BYTES} bytes limit",
                         },
                     }
-                    with self._lock:
-                        output_stream.write(json.dumps(err_resp, separators=(",", ":")) + "\n")
-                        output_stream.flush()
+                    try:
+                        serialized_err = json.dumps(err_resp, separators=(",", ":"))
+                        with self._lock:
+                            output_stream.write(serialized_err + "\n")
+                            output_stream.flush()
+                    except Exception:
+                        break
                     continue
 
                 stripped = line.strip()
@@ -433,6 +462,7 @@ class MCPServer:
 
                 response = self.handle_line(line)
                 if response is not None:
+                    serialized: Optional[str] = None
                     try:
                         clean_response = _sanitize_floats(response)
                         serialized = json.dumps(
@@ -442,13 +472,8 @@ class MCPServer:
                             allow_nan=False,
                             default=str,
                         )
-                        with self._lock:
-                            output_stream.write(serialized + "\n")
-                            output_stream.flush()
-                    except (BrokenPipeError, ConnectionResetError):
-                        break
                     except Exception as err:
-                        logger.error("Output stream serialization/write error: %s", err, exc_info=True)
+                        logger.error("Output stream serialization error: %s", err, exc_info=True)
                         fallback_err = {
                             "jsonrpc": "2.0",
                             "id": response.get("id") if isinstance(response, dict) else None,
@@ -458,10 +483,19 @@ class MCPServer:
                             },
                         }
                         try:
-                            with self._lock:
-                                output_stream.write(json.dumps(fallback_err, separators=(",", ":")) + "\n")
-                                output_stream.flush()
+                            serialized = json.dumps(fallback_err, separators=(",", ":"))
                         except Exception:
+                            serialized = None
+
+                    if serialized is not None:
+                        try:
+                            with self._lock:
+                                output_stream.write(serialized + "\n")
+                                output_stream.flush()
+                        except (BrokenPipeError, ConnectionResetError):
+                            break
+                        except Exception as err:
+                            logger.error("Output stream write error: %s", err, exc_info=True)
                             break
 
         except KeyboardInterrupt:
